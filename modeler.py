@@ -20,7 +20,7 @@ from OpenGL.GL import *
 
 from mesh_core import (Mesh, Camera, load_xyz, save_model, load_model, order_polygon,
                        ray_plane, ray_axis_param, pick_cloud_point, pick_mesh_vertex,
-                       pick_mesh_edge, pick_mesh_face, SurfaceIndex)
+                       pick_mesh_edge, pick_mesh_face, SurfaceIndex, frame_from_axes, pca_frame)
 from solids import SHAPES, SHAPE_NAMES, MIN_POINTS, fit_solid
 
 MAX_DISPLAY = 3_000_000   # points actually drawn (stride-decimated above this)
@@ -69,6 +69,7 @@ class Viewer(QOpenGLWidget):
         self.use_height_colors, self.auto_n = True, 4
         self.follow, self.surf_offset, self.surf_k, self.surf = False, 0.0, 24, None
         self.solid_shape, self.solid_seg, self.solid_preview, self.solid_info = "cylinder", 24, None, ""
+        self.local_axes = True   # gizmo / axis lock follow the selection's orientation
         # interaction state
         self.pending, self.drag, self.nav = [], None, None
         self.axis_lock, self.snap, self.hover_axis = None, None, None
@@ -259,6 +260,29 @@ class Viewer(QOpenGLWidget):
         l = np.linalg.norm(n)
         return n / l if l > 1e-6 * max(sum(w), 1e-12) else None
 
+    def selection_frame(self):
+        """Orthonormal frame (columns x, y, z) matching the selection's orientation, or None
+        (= world axes). Faces / edges / vertices: z = surface normal, x = first selected edge
+        or face edge. Selections with no normal (a closed solid): principal axes of the points."""
+        vs = self.sel_verts()
+        if not vs:
+            return None
+        m, V = self.mesh, self.mesh.V
+        z = self.selection_normal()
+        if z is None:
+            return pca_frame(V[vs])
+        if self.mode == "e" and self.sel:
+            a, b = sorted(self.sel)[0]
+            t = V[b] - V[a]
+        else:
+            fs = self.sel_faces()
+            if not fs:
+                vset = set(vs)
+                fs = [i for i, f in enumerate(m.F) if vset & set(f)]
+            f = m.F[fs[0]]
+            t = V[f[1]] - V[f[0]]
+        return frame_from_axes(z, t)
+
     def pick_element(self, x, y):
         m, r = self.mesh, self.snap_radius
         if self.mode == "v":
@@ -312,9 +336,13 @@ class Viewer(QOpenGLWidget):
         axes = [("X", np.array([1.0, 0, 0]), (0.95, 0.25, 0.25)),
                 ("Y", np.array([0, 1.0, 0]), (0.3, 0.85, 0.3)),
                 ("Z", np.array([0, 0, 1.0]), (0.35, 0.55, 1.0))]
-        n = self.selection_normal()
-        if n is not None:
-            axes.append(("N", n, (1.0, 0.9, 0.2)))
+        fr = self.selection_frame() if self.local_axes else None
+        if fr is not None:                    # handles follow the selection's orientation
+            axes = [(nm, fr[:, i], col) for i, (nm, _, col) in enumerate(axes)]
+        else:
+            n = self.selection_normal()
+            if n is not None:
+                axes.append(("N", n, (1.0, 0.9, 0.2)))
         return c, L, axes
 
     def pick_gizmo(self, x, y):
@@ -329,6 +357,8 @@ class Viewer(QOpenGLWidget):
             if (w <= self.cam.near).any():
                 continue
             A, B = np.array([sx[0], sy[0]]), np.array([sx[1], sy[1]])
+            if np.linalg.norm(p - A) < 12:    # on the gizmo origin: free-drag the element instead
+                continue
             AB = B - A
             t = np.clip(((p - A) @ AB) / max(AB @ AB, 1e-9), 0, 1)
             d = np.linalg.norm(A + AB * t - p)
@@ -428,7 +458,7 @@ class Viewer(QOpenGLWidget):
         self.tool = "move"
         self.changed(); self.update_hud(); self.selection_changed.emit()
         self.state_changed.emit()
-        self.msg("Extruded - drag the gizmo (N = along normal) to shape it")
+        self.msg("Extruded - drag the gizmo to shape it (blue Z = along the face normal)")
 
     def op_fill(self):
         vs = self.sel_verts()
@@ -454,15 +484,23 @@ class Viewer(QOpenGLWidget):
         if not self.sel:
             return self.need("something")
         self.push_undo()
-        if self.mode == "v":
-            self.mesh.remove_vertices(self.sel)
-        elif self.mode == "e":
-            ef = self.mesh.edge_faces()
-            self.mesh.delete_faces({f for e in self.sel for f in ef.get(e, [])})
+        note = ""
+        if self.mode == "v":                  # dissolve: surrounding faces merge, edges join
+            st = self.mesh.dissolve_vertices(self.sel)
+            if st["skipped"]:
+                note = "%d vertex(es) kept - removing them would tear the surface" % st["skipped"]
+        elif self.mode == "e":                # dissolve: the two faces beside the edge merge
+            st = self.mesh.dissolve_edges(sorted(self.sel))
+            if st["faces_removed"]:
+                note = "Border edge: nothing to merge with, so its face was removed"
+            elif st["skipped"]:
+                note = "%d edge(s) kept - they cannot be dissolved cleanly" % st["skipped"]
         else:
             self.mesh.delete_faces(self.sel)
         self.sel = set()
         self.changed(); self.selection_changed.emit()
+        if note:
+            self.msg(note)
 
     def op_flip(self):
         fs = self.sel_faces()
@@ -540,7 +578,8 @@ class Viewer(QOpenGLWidget):
         fwd = self.cam.forward()
         self.drag = dict(verts=vs, orig=orig, c=c, o0=o, r0=d, fwd=fwd, axis=axis,
                          p0=ray_plane(o, d, c, fwd), grab=c if grab is None else grab,
-                         moved=False, pushed=False, press=(x, y))
+                         moved=False, pushed=False, press=(x, y),
+                         frame=self.selection_frame() if self.local_axes else None)
 
     def apply_drag(self, x, y, ctrl):
         dr = self.drag
@@ -681,6 +720,8 @@ class Viewer(QOpenGLWidget):
         if k in (K.Key_X, K.Key_Y, K.Key_Z) and self.drag is not None and self.drag["axis"] is None:
             a = {K.Key_X: (1.0, 0, 0), K.Key_Y: (0, 1.0, 0), K.Key_Z: (0, 0, 1.0)}[k]
             a = np.array(a)
+            if self.drag["frame"] is not None:    # X/Y/Z lock uses the selection's own axes
+                a = self.drag["frame"][:, {K.Key_X: 0, K.Key_Y: 1, K.Key_Z: 2}[k]]
             self.axis_lock = None if (self.axis_lock is not None and np.allclose(self.axis_lock, a)) else a
             self.apply_drag(self.last[0], self.last[1], False)
         elif k in (K.Key_Return, K.Key_Enter) and self.tool == "points":
@@ -1050,7 +1091,13 @@ class MainWindow(QMainWindow):
             r = QHBoxLayout(); r.addWidget(QLabel(ax)); r.addWidget(sp); gl.addLayout(r)
         self.world_cb = QCheckBox("Show original (world) coordinates")
         self.world_cb.toggled.connect(self.refresh_coords)
-        gl.addWidget(self.world_cb); lay.addWidget(g)
+        gl.addWidget(self.world_cb)
+        self.local_cb = QCheckBox("Move handles follow selection orientation")
+        self.local_cb.setToolTip("On: handles align with the selected faces / edges / vertices "
+                                 "(blue Z = surface normal). Off: world X / Y / Z.")
+        self.local_cb.setChecked(self.v.local_axes)
+        self.local_cb.toggled.connect(lambda x: (setattr(self.v, "local_axes", x), self.v.update()))
+        gl.addWidget(self.local_cb); lay.addWidget(g)
 
         g = QGroupBox("Operations"); gl = QVBoxLayout(g)
         for text, fn in (("Subdivide (S)", self.v.op_subdivide), ("Extrude (E)", self.v.op_extrude),

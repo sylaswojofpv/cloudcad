@@ -96,6 +96,57 @@ def order_polygon(P):
     return list(range(n))
 
 
+def _edge_occ(f, a, b):
+    """How many times face loop f runs along edge a-b (either direction)."""
+    n = len(f)
+    return sum(1 for i in range(n)
+               if (f[i] == a and f[(i + 1) % n] == b) or (f[i] == b and f[(i + 1) % n] == a))
+
+
+def _clean_loop(loop):
+    """Drop consecutive duplicate vertices (cyclically). None if fewer than 3 remain."""
+    out = []
+    for v in loop:
+        if not out or out[-1] != v:
+            out.append(v)
+    while len(out) > 1 and out[0] == out[-1]:
+        out.pop()
+    return out if len(out) >= 3 else None
+
+
+def _despike(loop):
+    """Remove dangling spikes (x, y, x) left when a merge closes a slit in a polygon."""
+    loop = list(loop)
+    changed = True
+    while changed and len(loop) >= 3:
+        changed = False
+        n = len(loop)
+        for i in range(n):
+            if loop[i - 1] == loop[(i + 1) % n]:
+                j = (i + 1) % n
+                loop = [v for k, v in enumerate(loop) if k not in (i, j)]
+                changed = True
+                break
+    return loop
+
+
+def _merge_faces(f1, f2, a, b):
+    """Merge two faces across edge a-b into one loop (None if not a simple polygon)."""
+    n1, n2 = len(f1), len(f2)
+    i = next((k for k in range(n1) if f1[k] == a and f1[(k + 1) % n1] == b), None)
+    if i is None:                       # f1 runs b->a, so swap names
+        a, b = b, a
+        i = next((k for k in range(n1) if f1[k] == a and f1[(k + 1) % n1] == b), None)
+    j = next((k for k in range(n2) if f2[k] == b and f2[(k + 1) % n2] == a), None)
+    if j is None:                       # f2 runs the same way: flip it
+        f2 = f2[::-1]
+        j = next((k for k in range(n2) if f2[k] == b and f2[(k + 1) % n2] == a), None)
+    if i is None or j is None:
+        return None
+    m = _despike((f1[i + 1:] + f1[:i + 1]) + (f2[j + 1:] + f2[:j + 1])[1:-1])
+    return m if len(m) >= 3 and len(set(m)) == len(m) else None
+
+
 class Mesh:
     def __init__(self, V=None, F=None):
         self.V = np.zeros((0, 3)) if V is None else np.asarray(V, float).reshape(-1, 3)
@@ -294,6 +345,158 @@ class Mesh:
         self.V = self.V[keep]
         self._tri = None
         return mp
+
+    # ---- dissolve: delete elements without tearing holes in the surface
+    @staticmethod
+    def _neighbors(F, alive, v):
+        nb = set()
+        for k, f in enumerate(F):
+            if alive[k] and v in f:
+                n = len(f)
+                for i in range(n):
+                    if f[i] == v:
+                        nb.add(f[i - 1])
+                        nb.add(f[(i + 1) % n])
+        return nb
+
+    @staticmethod
+    def _strip_vertex(F, alive, v):
+        """Remove v from every face loop (its two edges join into one)."""
+        for k, f in enumerate(F):
+            if alive[k] and v in f:
+                g = _clean_loop([u for u in f if u != v])
+                if g is None:
+                    alive[k] = False
+                else:
+                    F[k] = g
+
+    def _straight(self, v, nb, cos_min):
+        p, q = sorted(nb)
+        d1, d2 = self.V[v] - self.V[p], self.V[q] - self.V[v]
+        l = np.linalg.norm(d1) * np.linalg.norm(d2)
+        return l < 1e-18 or float(d1 @ d2) / l >= cos_min
+
+    @staticmethod
+    def _fan_merge(F, fs, v):
+        """Merge all faces around v into one loop that no longer contains v."""
+        rot = {}
+        for k in fs:
+            f = F[k]
+            if f.count(v) != 1:
+                return None
+            i = f.index(v)
+            rot[k] = f[i:] + f[:i]                      # [v, a1, ..., am]
+        first = {k: r[1] for k, r in rot.items()}
+        last = {k: r[-1] for k, r in rot.items()}
+        starts = [k for k in fs if not any(last[g] == first[k] for g in fs if g != k)]
+        start = starts[0] if starts else fs[0]
+        order, cur = [start], start
+        while True:
+            nxt = [g for g in fs if g != cur and first[g] == last[cur]]
+            if len(nxt) != 1 or nxt[0] == start:
+                break
+            if nxt[0] in order:
+                return None
+            order.append(nxt[0])
+            cur = nxt[0]
+        if len(order) != len(fs):
+            return None
+        loop = []
+        for k in order:
+            p = rot[k][1:]
+            if loop and loop[-1] == p[0]:
+                p = p[1:]
+            loop += p
+        if len(loop) > 1 and loop[0] == loop[-1]:
+            loop.pop()
+        loop = _despike(loop)
+        return (order, loop) if len(loop) >= 3 and len(set(loop)) == len(loop) else None
+
+    def _compact(self, F, alive, drop):
+        keep = [i for i in range(len(self.V)) if i not in drop]
+        mp = {old: new for new, old in enumerate(keep)}
+        self.F = [[mp[v] for v in f] for k, f in enumerate(F) if alive[k]]
+        self.V = self.V[keep]
+        self._tri = None
+
+    def dissolve_edges(self, edges, max_bend_deg=45.0):
+        """Delete edges: the two faces on either side merge into one. An end vertex left with
+        only two roughly straight edges (bend under max_bend_deg) is removed so those edges
+        join into one; sharp corners stay. A boundary edge (one face) removes that face.
+        Returns {'merged', 'faces_removed', 'skipped'}."""
+        F = [list(f) for f in self.F]
+        alive = [True] * len(F)
+        ends, seen = set(), set()
+        st = dict(merged=0, faces_removed=0, skipped=0)
+        for a, b in edges:
+            hits = [(k, _edge_occ(f, a, b)) for k, f in enumerate(F) if alive[k] and _edge_occ(f, a, b)]
+            total = sum(o for _, o in hits)
+            if total == 0:                                # already gone (e.g. closed up by an earlier merge)
+                ends.update((a, b))
+                continue
+            if total == 1:                                # boundary: nothing to merge with
+                alive[hits[0][0]] = False
+                seen.update(F[hits[0][0]])
+                st["faces_removed"] += 1
+            elif total == 2 and len(hits) == 1:           # dangling slit, tidied below
+                ends.update((a, b))
+                st["merged"] += 1
+            elif total == 2:
+                m = _merge_faces(F[hits[0][0]], F[hits[1][0]], a, b)
+                if m is None:
+                    st["skipped"] += 1
+                    continue
+                F[hits[0][0]] = m
+                alive[hits[1][0]] = False
+                ends.update((a, b))
+                st["merged"] += 1
+            else:
+                st["skipped"] += 1
+        cos_min = np.cos(np.radians(max_bend_deg))
+        changed = True
+        while changed:                                    # removing one vertex may free another
+            changed = False
+            for v in sorted(ends):
+                nb = self._neighbors(F, alive, v)
+                if len(nb) == 1 or (len(nb) == 2 and self._straight(v, nb, cos_min)):
+                    self._strip_vertex(F, alive, v)
+                    if len(nb) == 1:                      # a dangling end went away: check its neighbour too
+                        ends.update(nb)
+                    changed = True
+        used = {u for k, f in enumerate(F) if alive[k] for u in f}
+        self._compact(F, alive, {v for v in (ends | seen) if v not in used})
+        return st
+
+    def dissolve_vertices(self, verts):
+        """Delete vertices: the faces around a vertex merge into one polygon; a vertex with just
+        two edges is removed and its edges join. Vertices that cannot be removed cleanly are
+        kept. Returns {'merged', 'skipped'}."""
+        F = [list(f) for f in self.F]
+        alive = [True] * len(F)
+        st = dict(merged=0, skipped=0)
+        gone = set()
+        for v in sorted(set(verts)):
+            fs = [k for k, f in enumerate(F) if alive[k] and v in f]
+            if not fs:
+                gone.add(v)
+                continue
+            if len(self._neighbors(F, alive, v)) > 2:
+                res = self._fan_merge(F, fs, v)
+                if res is None:
+                    st["skipped"] += 1
+                    continue
+                order, loop = res
+                gone.update(set().union(*(F[k] for k in order)) - set(loop))   # v and any closed-off spike
+                F[order[0]] = loop
+                for k in order[1:]:
+                    alive[k] = False
+                st["merged"] += len(order) - 1
+            else:
+                self._strip_vertex(F, alive, v)
+            gone.add(v)
+        used = {u for k, f in enumerate(F) if alive[k] for u in f}
+        self._compact(F, alive, {v for v in gone if v not in used})
+        return st
 
     def weld(self, verts):
         """Merge vertices into one at their centroid. Returns the merged vertex id."""
@@ -591,3 +794,44 @@ class SurfaceIndex:
             n[(n * ref).sum(1) < 0] *= -1
             P = P + n * offset
         return P
+
+
+# ============================================================ orientation frames ==
+def frame_from_axes(z, t=None):
+    """Right-handed orthonormal frame (columns x, y, z). z is given; x is t projected
+    into the plane perpendicular to z (any perpendicular if t is missing or parallel)."""
+    z = np.asarray(z, float)
+    z = z / np.linalg.norm(z)
+    x = None
+    if t is not None:
+        t = np.asarray(t, float)
+        x = t - (t @ z) * z
+        if np.linalg.norm(x) <= 1e-9 * max(np.linalg.norm(t), 1e-30):
+            x = None
+    if x is None:
+        ref = np.eye(3)[int(np.argmin(np.abs(z)))]
+        x = ref - (ref @ z) * z
+    x = x / np.linalg.norm(x)
+    return np.c_[x, np.cross(z, x), z]
+
+
+def pca_frame(P):
+    """Frame aligned with the principal axes of a point set (box, cylinder, flat patch...).
+    None when there is no meaningful orientation (under 3 points, or round like a sphere)."""
+    P = np.asarray(P, float)
+    if len(P) < 3:
+        return None
+    X = P - P.mean(0)
+    w, v = np.linalg.eigh(X.T @ X)                       # ascending eigenvalues
+    if w[2] <= 1e-18 or (w[2] - w[0]) < 0.05 * w[2]:
+        return None
+    canon = lambda a: a if a[int(np.argmax(np.abs(a)))] >= 0 else -a
+    tie_hi = (w[2] - w[1]) < 0.05 * w[2]
+    tie_lo = (w[1] - w[0]) < 0.05 * w[2]
+    if tie_hi and tie_lo:
+        return None
+    if tie_lo:                                           # rod / cylinder: z = its axis
+        return frame_from_axes(canon(v[:, 2]))
+    if tie_hi:                                           # disc / plate: z = its normal
+        return frame_from_axes(canon(v[:, 0]))
+    return frame_from_axes(canon(v[:, 0]), canon(v[:, 2]))   # box-like: x longest, z shortest
