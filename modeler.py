@@ -6,22 +6,29 @@ Point Cloud Modeler  --  simple freeform-style surface modeling over an .xyz poi
 """
 import os
 import sys
+import copy
+import json
 import ctypes
 import traceback
+from collections import Counter
 import numpy as np
 
-from PySide6.QtCore import Qt, Signal, QEventLoop
+from PySide6.QtCore import Qt, Signal, QEventLoop, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QSurfaceFormat
 from PySide6.QtWidgets import (QApplication, QMainWindow, QFileDialog, QDockWidget, QWidget,
                                QVBoxLayout, QHBoxLayout, QGroupBox, QLabel, QDoubleSpinBox,
-                               QSpinBox, QCheckBox, QSlider, QPushButton, QMessageBox, QComboBox, QScrollArea)
+                               QSpinBox, QCheckBox, QSlider, QPushButton, QMessageBox, QComboBox, QScrollArea,
+                               QToolButton, QSizePolicy, QButtonGroup, QGridLayout)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 
 from mesh_core import (Mesh, Camera, load_xyz, save_model, load_model, order_polygon,
                        ray_plane, ray_axis_param, pick_cloud_point, pick_mesh_vertex,
                        pick_mesh_edge, pick_mesh_face, SurfaceIndex, frame_from_axes, pca_frame)
-from solids import SHAPES, SHAPE_NAMES, MIN_POINTS, fit_solid
+from solids import SHAPES, SHAPE_NAMES, MIN_POINTS, SWEEP_SHAPES, fit_solid
+from booleans import shells_of, boolean_op, replace_faces, split_loose
+from bodies import Registry, OP_NAMES, extract_faces, geom_sig
+from bodies_panel import BodiesPanel
 
 MAX_DISPLAY = 3_000_000   # points actually drawn (stride-decimated above this)
 MAX_SNAP = 400_000        # points tested during hover / drag snapping
@@ -33,6 +40,11 @@ HINTS = {
     "move": "Drag a handle or element. X/Y/Z lock axis, Ctrl = snap to cloud, Esc cancels",
     "points": "Click cloud points (Ctrl = ignore mesh verts). Enter = make face, Backspace = undo point, Esc = cancel",
     "solid": "Click points on the object's surface - more points = better fit. Enter = create, Backspace = undo point, Esc = cancel",
+}
+SOLID_HINTS = {
+    "plane": "Click points on the flat surface (3+). Enter = create, Backspace = undo point, Esc = cancel",
+    "extrude": "Click many points all around the shape's sides (not just one face). The 2D profile and direction are fitted to all of them. Enter = create, Backspace = undo, Esc = cancel",
+    "loft": "Click many points over the surface, all around and along its length. Sections are fitted to all of them. Enter = create, Backspace = undo, Esc = cancel",
 }
 
 
@@ -47,9 +59,14 @@ class Viewer(QOpenGLWidget):
     status = Signal(str)
     selection_changed = Signal()
     state_changed = Signal()
+    bodies_changed = Signal()      # the Bodies list needs a refresh
 
     def __init__(self):
         super().__init__()
+        self._body_timer = QTimer(self)          # bodies are re-synced shortly after the mesh stops changing
+        self._body_timer.setSingleShot(True)
+        self._body_timer.setInterval(200)
+        self._body_timer.timeout.connect(self._refresh_bodies)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.cam = Camera()
@@ -69,7 +86,11 @@ class Viewer(QOpenGLWidget):
         self.use_height_colors, self.auto_n = True, 4
         self.follow, self.surf_offset, self.surf_k, self.surf = False, 0.0, 24, None
         self.solid_shape, self.solid_seg, self.solid_preview, self.solid_info = "cylinder", 24, None, ""
+        self.sweep_mode, self.sweep_lseg = "linear", 0       # loft / extrusion: linear or fitted, segments along the length (0 = auto)
         self.local_axes = True   # gizmo / axis lock follow the selection's orientation
+        self.reg = Registry()    # bodies + boolean folders (see bodies.py)
+        self.clouds = []         # loaded point clouds: dicts name / pts (local float32) / visible
+        self.editing = None      # id of the body whose points are being edited
         # interaction state
         self.pending, self.drag, self.nav = [], None, None
         self.axis_lock, self.snap, self.hover_axis = None, None, None
@@ -89,6 +110,11 @@ class Viewer(QOpenGLWidget):
         self.mesh.touch()
         self._arr = None
         self.update()
+        self._body_timer.start()
+
+    def _refresh_bodies(self):
+        self.sync_bodies()
+        self.bodies_changed.emit()
 
     def update_hud(self):
         extra = ""
@@ -99,14 +125,15 @@ class Viewer(QOpenGLWidget):
             extra = "  [%s: %d pts%s]" % (SHAPE_NAMES[self.solid_shape], len(self.pending), self.solid_info)
         self.hud.setText("<b>%s</b>   |   select: %s%s<br><span style='color:#9fb0c3'>%s<br>"
                          "MMB orbit · Shift+MMB / RMB pan · wheel zoom · Home frame</span>"
-                         % (TOOLS[self.tool], MODES[self.mode], extra + ("  |  follow surface ON" if self.follow else ""), HINTS[self.tool]))
+                         % (TOOLS[self.tool], MODES[self.mode], extra + ("  |  follow surface ON" if self.follow else ""),
+                            SOLID_HINTS.get(self.solid_shape, HINTS["solid"]) if self.tool == "solid" else HINTS[self.tool]))
         self.hud.adjustSize()
 
     def msg(self, s):
         self.status.emit(s)
 
     def snapshot(self):
-        return (self.mesh.copy(), self.mode, set(self.sel))
+        return (self.mesh.copy(), self.mode, set(self.sel), copy.deepcopy(self.reg))
 
     def push_undo(self):
         self.undo.append(self.snapshot())
@@ -117,10 +144,12 @@ class Viewer(QOpenGLWidget):
 
     def restore(self, snap):
         self.mesh, self.mode, self.sel = snap[0].copy(), snap[1], set(snap[2])
+        self.reg = copy.deepcopy(snap[3])
         self.sel_trail = []
         self.drag = None
         self.changed()
         self.selection_changed.emit()
+        self.bodies_changed.emit()
         self.update_hud()
 
     def do_undo(self):
@@ -154,7 +183,8 @@ class Viewer(QOpenGLWidget):
             self.solid_info = ", need %d+" % need
             return
         try:
-            V, F, info = fit_solid(self.solid_shape, np.array([p[2] for p in self.pending]), self.solid_seg)
+            V, F, info = fit_solid(self.solid_shape, np.array([p[2] for p in self.pending]), self.solid_seg,
+                                    self.sweep_mode, self.sweep_lseg)
             self.solid_preview, self.solid_info = (V, F), ", " + info
         except Exception as ex:
             self.solid_info = ", no fit (%s)" % ex
@@ -163,19 +193,181 @@ class Viewer(QOpenGLWidget):
         if self.solid_preview is None:
             return self.msg("Pick more points first")
         V, F = self.solid_preview
+        src = dict(shape=self.solid_shape, pts=np.array([p[2] for p in self.pending], float), seg=self.solid_seg,
+                   mode=self.sweep_mode, lseg=self.sweep_lseg, sig=geom_sig(V))
+        self.sync_bodies()
+        if self.editing is not None and self.editing in self.reg.bodies:
+            return self._finish_edit(V, F, src)
         self.push_undo()
-        base = len(self.mesh.V)
-        self.mesh.V = np.vstack([self.mesh.V, V])
-        ids = [self.mesh.add_face([base + i for i in f]) for f in F]
+        body = self.reg.new_body(SHAPE_NAMES[self.solid_shape], "solid", src)
+        ids = replace_faces(self.mesh, [], V, F, tag=body.id)
         self.pending = []
         self.mode, self.sel, self.tool = "f", set(ids), "move"
         self.changed(); self.update_hud(); self.selection_changed.emit(); self.state_changed.emit()
+        self.bodies_changed.emit()
         self.msg("%s created. Drag it, or select faces / vertices to move and extrude (E)" % SHAPE_NAMES[self.solid_shape])
+
+    # ------------------------------------------------------------- bodies list
+    def sync_bodies(self):
+        """Give every untagged face a body (connected solids that carry no tag become new bodies)
+        and forget bodies that have no faces left (boolean results are kept so they can be undone)."""
+        m, reg = self.mesh, self.reg
+        for i, t in enumerate(m.T):
+            if t not in reg.bodies or reg.bodies[t].state != "live":
+                m.T[i] = -1
+        if any(t < 0 for t in m.T):
+            for fl in shells_of(m):
+                tags = [m.T[i] for i in fl]
+                if -1 not in tags:
+                    continue
+                known = [t for t in tags if t >= 0]
+                t = Counter(known).most_common(1)[0][0] if known else reg.new_body("Body", "mesh").id
+                for i in fl:
+                    if m.T[i] < 0:
+                        m.T[i] = t
+        used = set(m.T)
+        for bid in [b.id for b in reg.bodies.values() if b.state == "live"]:
+            if bid not in used and not reg.is_result(bid):
+                del reg.bodies[bid]
+
+    def body_faces(self, bid):
+        return [i for i, t in enumerate(self.mesh.T) if t == bid]
+
+    def select_body(self, bid):
+        b = self.reg.bodies.get(bid)
+        if b is None or b.state != "live":
+            return
+        self.mode, self.sel, self.sel_trail = "f", set(self.body_faces(bid)), []
+        self._arr = None
+        self.update_hud(); self.update(); self.selection_changed.emit(); self.state_changed.emit()
+
+    def set_body_visible(self, bid, vis):
+        self.sync_bodies()
+        b = self.reg.bodies.get(bid)
+        if b is None or b.state == "consumed" or (b.state == "live") == vis:
+            return
+        self.push_undo()
+        if vis:
+            replace_faces(self.mesh, [], b.geom[0], b.geom[1], tag=bid)
+            b.geom, b.state = None, "live"
+        else:
+            faces = self.body_faces(bid)
+            b.geom = extract_faces(self.mesh, faces)
+            replace_faces(self.mesh, faces, [], [], -1)
+            b.state = "hidden"
+        self.sel, self.sel_trail = set(), []
+        self.changed(); self.selection_changed.emit(); self.bodies_changed.emit()
+
+    def set_cloud_visible(self, idx, vis):
+        if 0 <= idx < len(self.clouds) and self.clouds[idx]["visible"] != vis:
+            self.clouds[idx]["visible"] = vis
+            self._rebuild_cloud()
+
+    # --- booleans as folders
+    def _folder_boolean(self, f, geoms):
+        """Run folder f's boolean on its operands' stored geometry (geoms overrides by body id)."""
+        tmp, shells = Mesh(), []
+        for o in f.operands:
+            V, F = geoms[o] if o in geoms else self.reg.bodies[o].geom
+            base, first = len(tmp.V), len(tmp.F)
+            tmp.V = np.vstack([tmp.V, V])
+            for fc in F:
+                tmp.add_face([base + k for k in fc])
+            shells.append(list(range(first, len(tmp.F))))
+        return boolean_op(tmp, f.kind if hasattr(f, "kind") else f.op, shells)
+
+    def undo_boolean(self, fid):
+        self.sync_bodies()
+        reg, m = self.reg, self.mesh
+        f = reg.folders.get(fid)
+        if f is None:
+            return
+        if reg.parent_folder(fid) is not None:
+            return self.msg("This boolean is inside another one - undo the outer boolean first")
+        self.push_undo()
+        r = reg.bodies.get(f.result)
+        if r is not None:
+            faces = self.body_faces(r.id)
+            if faces:
+                replace_faces(m, faces, [], [], -1)
+            del reg.bodies[r.id]
+        ids = []
+        for o in f.operands:
+            b = reg.bodies[o]
+            V, F = b.geom
+            b.geom, b.state, b.folder = None, "live", None
+            ids += replace_faces(m, [], V, F, tag=o)
+        del reg.folders[fid]
+        self.mode, self.sel, self.sel_trail = "f", set(ids), []
+        self.changed(); self.selection_changed.emit(); self.bodies_changed.emit()
+        self.msg("%s undone - the original solids are back" % f.name)
+
+    # --- editing the points a solid was made from
+    def edit_body_points(self, bid):
+        self.sync_bodies()
+        b = self.reg.bodies.get(bid)
+        if b is None or not b.src:
+            return self.msg("This body has no stored points (only solids made with the Solid tool do)")
+        if b.state == "live":
+            V = extract_faces(self.mesh, self.body_faces(bid))[0]
+        else:
+            V = b.geom[0]
+        if geom_sig(V) != b.src.get("sig") and QMessageBox.question(
+                self, "Edit points",
+                "'%s' was reshaped by hand since it was created.\nApplying new points will replace those edits. Continue?" % b.name
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        s = b.src
+        self.editing, self.tool, self.drag = bid, "solid", None
+        self.solid_shape, self.solid_seg = s["shape"], s["seg"]
+        self.sweep_mode, self.sweep_lseg = s["mode"], s["lseg"]
+        self.pending = [("cloud", -1, np.array(p, float)) for p in s["pts"]]
+        self.update_hud(); self.update(); self.state_changed.emit()
+        self.msg("Editing the points of '%s': click a point to remove it, click the cloud to add points, "
+                 "Enter = apply, Esc = cancel" % b.name)
+
+    def _finish_edit(self, V, F, src):
+        reg, m = self.reg, self.mesh
+        b = reg.bodies[self.editing]
+        ids = []
+        if b.state == "consumed":                      # operand of a boolean: redo the boolean(s) above it
+            geoms, updates, f = {b.id: (V, F)}, [], reg.folders.get(b.folder)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                while f is not None:
+                    rV, rF, _ = self._folder_boolean(f, geoms)
+                    r = reg.bodies[f.result]
+                    updates.append((r, rV, rF))
+                    geoms[r.id] = (rV, rF)
+                    f = reg.folders.get(r.folder) if r.state == "consumed" else None
+            except (ValueError, ImportError) as ex:
+                return self.msg("The boolean can't be redone with these points: %s" % ex)
+            finally:
+                QApplication.restoreOverrideCursor()
+            self.push_undo()
+            b.geom = (V, F)
+            for r, rV, rF in updates:
+                if r.state == "live":
+                    ids = replace_faces(m, self.body_faces(r.id), rV, rF, tag=r.id)
+                else:
+                    r.geom = (rV, rF)
+        elif b.state == "live":
+            self.push_undo()
+            ids = replace_faces(m, self.body_faces(b.id), V, F, tag=b.id)
+        else:
+            self.push_undo()
+            b.geom = (V, F)
+        b.src = src
+        self.editing, self.pending = None, []
+        self.mode, self.sel, self.sel_trail, self.tool = "f", set(ids), [], "move"
+        self.changed(); self.update_hud(); self.selection_changed.emit(); self.state_changed.emit()
+        self.bodies_changed.emit()
+        self.msg("Points applied to '%s'" % b.name)
 
     def get_surface(self):
         if self.surf is None:
             if self.cloud_full is None:
-                self.msg("Load a point cloud first")
+                self.msg("Load a point cloud first (and make sure it is visible)")
                 return None
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
@@ -213,10 +405,13 @@ class Viewer(QOpenGLWidget):
 
     def set_tool(self, t):
         self.tool = t
+        if t != "solid":
+            self.editing = None
         self.pending.clear()
         self.drag = None
         self.update_hud()
         self.update()
+        self.state_changed.emit()
 
     # --------------------------------------------------------------- selection
     def sel_verts(self):
@@ -368,32 +563,69 @@ class Viewer(QOpenGLWidget):
 
     # ----------------------------------------------------------------- cloud
     def load_cloud(self, paths, append=False):
-        """Load one or more files into a single cloud. append=True keeps what is loaded."""
+        """Load files, one point cloud per file. append=True keeps the clouds already loaded."""
         if isinstance(paths, str):
             paths = [paths]
-        arrays, errors = [], []
+        loaded, errors = [], []
         for p in paths:
             try:
                 a = load_xyz(p)
                 if len(a) == 0:
                     raise ValueError("no points")
-                arrays.append(a)
+                loaded.append((os.path.basename(p), a))
             except Exception as ex:
                 errors.append("%s: %s" % (os.path.basename(p), ex))
-        if not arrays:
+        if not loaded:
             raise ValueError("\n".join(errors) or "No files given")
-        nfiles = len(arrays)
-        if append and self.cloud_full is not None:
-            arrays.insert(0, self.cloud_full.astype(np.float64) + self.origin)
-        else:
-            append = False
-        pts = np.concatenate(arrays)
-        self.surf = None
-        lo, hi = pts.min(0), pts.max(0)
+        if not append:
+            self.clouds = []
+        lo = np.min([a.min(0) for _, a in loaded], axis=0)
+        hi = np.max([a.max(0) for _, a in loaded], axis=0)
+        for c in self.clouds:                              # everything already loaded counts for the bounds
+            lo = np.minimum(lo, c["pts"].min(0) + self.origin)
+            hi = np.maximum(hi, c["pts"].max(0) + self.origin)
         old = self.origin.copy()
         self.origin = (lo + hi) / 2.0
-        self.mesh.V = self.mesh.V + (old - self.origin)   # keep existing model aligned
-        local = (pts - self.origin).astype(np.float32)
+        delta = old - self.origin
+        for c in self.clouds:
+            c["pts"] = (c["pts"].astype(np.float64) + delta).astype(np.float32)
+        self.mesh.V = self.mesh.V + delta                  # keep existing model aligned
+        self.reg.shift(delta)
+        taken = {c["name"] for c in self.clouds}
+        for name, a in loaded:
+            base, n = name, 2
+            while name in taken:
+                name, n = "%s (%d)" % (base, n), n + 1
+            taken.add(name)
+            self.clouds.append(dict(name=name, pts=(a - self.origin).astype(np.float32), visible=True))
+        ext = hi - lo
+        if self.pristine:
+            self.mesh = Mesh.plane((0, 0, 0), max(0.4 * max(ext[0], ext[1]), 1e-3))
+            self.reg = Registry()
+            self.sel = set()
+        self._rebuild_cloud()
+        if not append:
+            self.cam.frame((0, 0, 0), 0.5 * float(np.linalg.norm(ext)))
+        self._arr = None
+        self.update()
+        self.selection_changed.emit()
+        self.bodies_changed.emit()
+        n = sum(len(c["pts"]) for c in self.clouds)
+        self.msg("Loaded %d file(s): %s points total (drawing %s)"
+                 % (len(loaded), format(n, ","), format(self.n_disp, ",")))
+        return errors
+
+    def _rebuild_cloud(self):
+        """Display / snap / surface data come from the visible clouds only."""
+        vis = [c["pts"] for c in self.clouds if c["visible"]]
+        self.surf = None
+        self._cloud_dirty = True
+        if not vis:
+            self.cloud_full = self.cloud_snap = self.cloud_disp = self.cloud_cols = None
+            self.n_disp = 0
+            self.update()
+            return
+        local = np.concatenate(vis)
         n = len(local)
         stride = max(1, int(np.ceil(n / MAX_DISPLAY)))
         self.cloud_full = local
@@ -402,20 +634,8 @@ class Viewer(QOpenGLWidget):
         self.cloud_snap = local if s2 == 1 else np.ascontiguousarray(local[::s2])
         self.cloud_cols = height_colors(self.cloud_disp[:, 2])
         self.n_disp = len(self.cloud_disp)
-        self._cloud_dirty = True
         self.grid_z = float(local[:, 2].min())
-        ext = hi - lo
-        if self.pristine:
-            self.mesh = Mesh.plane((0, 0, 0), max(0.4 * max(ext[0], ext[1]), 1e-3))
-            self.sel = set()
-        if not append:
-            self.cam.frame((0, 0, 0), 0.5 * float(np.linalg.norm(ext)))
-        self._arr = None
         self.update()
-        self.selection_changed.emit()
-        self.msg("Loaded %d file(s): %s points total (drawing %s)"
-                 % (nfiles, format(n, ","), format(self.n_disp, ",")))
-        return errors
 
     def frame_all(self):
         if self.cloud_full is not None:
@@ -502,6 +722,63 @@ class Viewer(QOpenGLWidget):
         if note:
             self.msg(note)
 
+    def boolean_shells(self):
+        """Solids touched by the selection, in the order they were picked (click, Shift+click...)."""
+        m = self.mesh
+        sh = shells_of(m)
+        face_shell = {f: k for k, fl in enumerate(sh) for f in fl}
+        vert_shell = {v: k for f, k in face_shell.items() for v in m.F[f]}
+
+        def shell_of(item):
+            if self.mode == "f":
+                return face_shell.get(item)
+            return vert_shell.get(item if self.mode == "v" else item[0])
+
+        order = []
+        for it in [i for i in self.sel_trail if i in self.sel] + sorted(self.sel):
+            k = shell_of(it)
+            if k is not None and k not in order:
+                order.append(k)
+        return [sh[k] for k in order]
+
+    def op_boolean(self, kind):
+        self.sync_bodies()
+        solids = self.boolean_shells()
+        if len(solids) < 2:
+            return self.msg("Boolean needs two or more solids: click one, then Shift+click the others")
+        parts = [split_loose(self.mesh, s_) for s_ in solids]     # loose faces stuck to a solid stay out of the boolean
+        solids, n_loose = [p[0] for p in parts], sum(len(p[1]) for p in parts)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            V, F, info = boolean_op(self.mesh, kind, solids)
+        except (ValueError, ImportError) as ex:
+            return self.msg(str(ex))
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.push_undo()
+        reg, m = self.reg, self.mesh
+        operands = []
+        for shell in solids:                               # one body per solid, in pick order
+            bid = Counter(m.T[i] for i in shell).most_common(1)[0][0]
+            if bid in operands or bid not in reg.bodies:   # two solids sharing a body id: split it
+                bid = reg.new_body("Body", "mesh").id
+            for i in shell:
+                m.T[i] = bid
+            reg.bodies[bid].geom = extract_faces(m, shell)
+            operands.append(bid)
+        result = reg.new_body("Combined", "boolean")
+        reg.new_folder(kind, operands, result.id)          # puts the operands inside the folder
+        for bid in operands:
+            reg.bodies[bid].state = "consumed"
+        ids = replace_faces(m, [i for s_ in solids for i in s_], V, F, tag=result.id)
+        self.mode, self.sel, self.sel_trail = "f", set(ids), []
+        self.changed(); self.update_hud(); self.selection_changed.emit(); self.state_changed.emit()
+        self.bodies_changed.emit()
+        note = ("  (%d loose face%s stuck to the solids kept as a separate body)"
+                % (n_loose, "" if n_loose == 1 else "s")) if n_loose else ""
+        self.msg(info + ("  [first-picked solid minus the others]" if kind == "difference" else "") + note
+                 + "  - undo it from its folder in the Bodies list")
+
     def op_flip(self):
         fs = self.sel_faces()
         if not fs:
@@ -531,20 +808,27 @@ class Viewer(QOpenGLWidget):
 
     # ------------------------------------------------------------------ files
     def save(self, path):
-        save_model(path, self.mesh, self.origin)
+        self.sync_bodies()
+        save_model(path, self.mesh, self.origin, extra={"bodies": self.reg.to_dict()})
 
     def open_model(self, path):
         m, org = load_model(path)
+        with open(path) as fh:
+            reg_data = json.load(fh).get("bodies")
         self.push_undo()
-        if self.cloud_full is None:
+        if not self.clouds:
             self.origin = org
-            self.mesh = m
+            shift = np.zeros(3)
         else:
-            m.V = m.V + (org - self.origin)
-            self.mesh = m
-        self.sel = set()
+            shift = org - self.origin
+            m.V = m.V + shift
+        self.mesh = m
+        self.reg = Registry.from_dict(reg_data)
+        self.reg.shift(shift)
+        self.sel, self.editing, self.pending = set(), None, []
         self.pristine = False
-        self.changed(); self.selection_changed.emit()
+        self.sync_bodies()
+        self.changed(); self.selection_changed.emit(); self.bodies_changed.emit()
 
     def export_obj(self, path, original_coords):
         self.mesh.export_obj(path, self.origin if original_coords else np.zeros(3))
@@ -673,6 +957,16 @@ class Viewer(QOpenGLWidget):
                 if self.auto_n and len(self.pending) >= self.auto_n:
                     self.finish_points_face()
             elif self.tool == "solid":
+                if self.pending:                           # clicking near a picked point removes it
+                    P = np.array([p[2] for p in self.pending])
+                    sx, sy, _, w = self.cam.project(P)
+                    d = np.hypot(sx - x, sy - y)
+                    d[w <= self.cam.near] = np.inf
+                    k = int(np.argmin(d))
+                    if d[k] <= max(self.snap_radius, 8.0):
+                        del self.pending[k]
+                        self.update_hud(); self.update()
+                        return self.msg("Point removed (%d left)" % len(self.pending))
                 sn = self.find_snap(x, y, full=True, cloud_only=True)
                 if sn is None:
                     return self.msg("No cloud point under cursor")
@@ -733,8 +1027,9 @@ class Viewer(QOpenGLWidget):
         elif k == K.Key_Escape:
             if self.drag is not None:
                 self.cancel_drag()
-            elif self.pending:
-                self.pending = []; self.update_hud(); self.update()
+            elif self.pending or self.editing is not None:
+                self.pending, self.editing = [], None
+                self.update_hud(); self.update()
             else:
                 self.apply_pick(None, False)
         else:
@@ -937,6 +1232,63 @@ class Viewer(QOpenGLWidget):
 
 
 # ============================================================== main window ==
+SEG_SHAPES = ("cylinder", "cone", "sphere", "loft", "extrude")   # shapes whose smoothness "Segments" controls
+TOOL_NAMES = {"select": "Select", "move": "Move / Transform", "points": "Face from points", "solid": "Best-fit solid"}
+# edit buttons: (label, Viewer method, modes in which the button is shown)
+EDIT_OPS = (("Subdivide", "op_subdivide", "f", "Subdivide faces (S)"), ("Extrude", "op_extrude", "ef", "Extrude (E)"),
+            ("Fill face", "op_fill", "v", "Fill a face from the selected vertices (F)"),
+            ("Weld", "op_weld", "v", "Weld the selected vertices into one (M)"),
+            ("Flip", "op_flip", "f", "Flip normals (N)"),
+            ("Snap", "op_snap_surface", "vef", "Snap the selection to the cloud surface (Shift+S)"),
+            ("Delete", "op_delete", "vef", "Delete (Del)"))
+
+
+class Section(QWidget):
+    """A header that folds / unfolds its content - used for options most people rarely need."""
+    def __init__(self, title, collapsed=True):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.btn = QToolButton()
+        self.btn.setText(title)
+        self.btn.setCheckable(True)
+        self.btn.setChecked(not collapsed)
+        self.btn.setAutoRaise(True)
+        self.btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn.setArrowType(Qt.ArrowType.DownArrow if not collapsed else Qt.ArrowType.RightArrow)
+        self.btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn.setStyleSheet("QToolButton{text-align:left;font-weight:bold;}")
+        self.body = QWidget()
+        self.body.setVisible(not collapsed)
+        self.body_lay = QVBoxLayout(self.body)
+        self.body_lay.setContentsMargins(14, 0, 0, 0)
+        self.body_lay.setSpacing(3)
+        self.btn.toggled.connect(self._toggled)
+        lay.addWidget(self.btn)
+        lay.addWidget(self.body)
+
+    def _toggled(self, on):
+        self.body.setVisible(on)
+        self.btn.setArrowType(Qt.ArrowType.DownArrow if on else Qt.ArrowType.RightArrow)
+
+
+def _row(label, widget):
+    r = QHBoxLayout()
+    r.setSpacing(4)
+    r.addWidget(QLabel(label))
+    r.addStretch(1)
+    r.addWidget(widget)
+    return r
+
+
+def _small(text):
+    l = QLabel(text)
+    l.setWordWrap(True)
+    l.setStyleSheet("color:#8a97a6;")
+    return l
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -948,10 +1300,24 @@ class MainWindow(QMainWindow):
         self.v.status.connect(lambda s: self.statusBar().showMessage(s, 8000))
         self._busy = False
         self._build_actions()
+        self._build_toolbar()
         self._build_dock()
+        self.bodies_dock = QDockWidget("Bodies", self)       # left: point clouds, bodies, boolean folders
+        self.bodies_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
+                                     | QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.bodies_panel = BodiesPanel(self.v)
+        self.bodies_dock.setWidget(self.bodies_panel)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.bodies_dock)
+        self.bodies_dock.setMinimumWidth(150)
+        self.resizeDocks([self.bodies_dock, self.props_dock], [185, 225], Qt.Orientation.Horizontal)
+        self._build_view_menu()
         self.v.selection_changed.connect(self.refresh_coords)
+        self.v.selection_changed.connect(self.update_panel)
         self.v.state_changed.connect(self.sync_checked)
-        self.statusBar().showMessage("File > Open point cloud (Ctrl+O) to begin")
+        self.v.state_changed.connect(self.sync_solid_controls)
+        self.refresh_coords()
+        self.update_panel()
+        self.statusBar().showMessage("File > Open point clouds (Ctrl+O) to begin, or drop files onto the window")
 
     def act(self, text, key, slot, menu, tip="", checkable=False, group=None):
         a = QAction(text, self)
@@ -965,36 +1331,32 @@ class MainWindow(QMainWindow):
             group.addAction(a)
         return a
 
+    # ------------------------------------------------------------------ menus
     def _build_actions(self):
         mb = self.menuBar()
-        f, ed, t, vw = mb.addMenu("&File"), mb.addMenu("&Edit"), mb.addMenu("&Tools"), mb.addMenu("&View")
+        f, ed, t, cr, md, self.view_menu = (mb.addMenu("&File"), mb.addMenu("&Edit"), mb.addMenu("&Tools"),
+                                           mb.addMenu("&Create"), mb.addMenu("&Modify"), mb.addMenu("&View"))
         self.act("Open point clouds…", "Ctrl+O", self.open_cloud, f)
         self.act("Add point clouds…", "Ctrl+Shift+O", lambda: self.open_cloud(append=True), f)
+        f.addSeparator()
         self.act("Open model…", None, self.open_model, f)
         self.act("Save model…", "Ctrl+S", self.save_model, f)
         f.addSeparator()
-        self.act("Export OBJ (original coordinates)…", None, lambda: self.export(True), f)
-        self.act("Export OBJ (cloud-centered)…", None, lambda: self.export(False), f)
+        ex = f.addMenu("Export OBJ")
+        self.act("Original coordinates…", None, lambda: self.export(True), ex)
+        self.act("Cloud-centered…", None, lambda: self.export(False), ex)
         f.addSeparator()
         self.act("Quit", "Ctrl+Q", self.close, f)
 
-        self.act("Undo", "Ctrl+Z", self.v.do_undo, ed)
-        self.act("Redo", "Ctrl+Y", self.v.do_redo, ed)
+        self.undo_act = self.act("Undo", "Ctrl+Z", self.v.do_undo, ed)
+        self.redo_act = self.act("Redo", "Ctrl+Y", self.v.do_redo, ed)
         ed.addSeparator()
-        self.act("Add plane", "Shift+A", self.v.op_add_plane, ed)
-        self.act("Subdivide faces", "S", self.v.op_subdivide, ed)
-        self.act("Extrude faces / edges", "E", self.v.op_extrude, ed)
-        self.act("Fill face from selected vertices", "F", self.v.op_fill, ed)
-        self.act("Weld selected vertices", "M", self.v.op_weld, ed)
-        self.act("Flip normals", "N", self.v.op_flip, ed)
-        self.act("Snap selection to cloud surface", "Shift+S", self.v.op_snap_surface, ed)
         self.act("Delete selection", "Delete", self.v.op_delete, ed)
 
         tg = QActionGroup(self)
         self.tool_acts = {}
-        for key, name, sc in (("select", "Select", "Q"), ("move", "Move / Transform", "W"), ("points", "Face from cloud points", "P"),
-                        ("solid", "Solid from points (best fit)", "B")):
-            self.tool_acts[key] = self.act(name, sc, lambda k=key: self.v.set_tool(k), t, checkable=True, group=tg)
+        for key, sc in (("select", "Q"), ("move", "W"), ("points", "P"), ("solid", "B")):
+            self.tool_acts[key] = self.act(TOOL_NAMES[key], sc, lambda k=key: self.v.set_tool(k), t, checkable=True, group=tg)
         self.tool_acts["move"].setChecked(True)
         t.addSeparator()
         mg = QActionGroup(self)
@@ -1005,23 +1367,80 @@ class MainWindow(QMainWindow):
         t.addSeparator()
         self.follow_act = self.act("Follow cloud surface while moving", "C",
                                    lambda: self.v.set_follow(self.follow_act.isChecked()), t, checkable=True)
-        sm = t.addMenu("Solid shape")
+
+        self.act("Plane", "Shift+A", self.v.op_add_plane, cr)
+        self.act("Face from cloud points", None, lambda: self.v.set_tool("points"), cr)
+        sm = cr.addMenu("Best-fit solid")
         for key in SHAPES:
             self.act(SHAPE_NAMES[key], None, lambda k=key: self.pick_solid(k), sm)
 
+        self.act("Subdivide faces", "S", self.v.op_subdivide, md)
+        self.act("Extrude faces / edges", "E", self.v.op_extrude, md)
+        self.act("Fill face from selected vertices", "F", self.v.op_fill, md)
+        self.act("Weld selected vertices", "M", self.v.op_weld, md)
+        self.act("Flip normals", "N", self.v.op_flip, md)
+        self.act("Snap selection to cloud surface", "Shift+S", self.v.op_snap_surface, md)
+        md.addSeparator()
+        bm = md.addMenu("Combine solids (select 2+ first)")
+        for kind, label in (("union", "Union"), ("difference", "Difference (first picked - others)"), ("intersect", "Intersect")):
+            self.act(label, None, lambda k=kind: self.v.op_boolean(k), bm)
+
+        vw = self.view_menu
         self.act("Frame all", "Home", self.v.frame_all, vw)
         self.act("Top", "Ctrl+1", lambda: self.v.view_preset(-90, 89.5), vw)
         self.act("Front", "Ctrl+2", lambda: self.v.view_preset(-90, 0), vw)
         self.act("Right", "Ctrl+3", lambda: self.v.view_preset(0, 0), vw)
+        vw.addSeparator()
 
+    def _build_view_menu(self):
+        """Panel toggles - added once both docks exist."""
+        vw = self.view_menu
+        for dock, key in ((self.bodies_dock, "F2"), (self.props_dock, "F3")):
+            a = dock.toggleViewAction()
+            a.setShortcut(QKeySequence(key))
+            vw.addAction(a)
+        self.act("Hide / show both panels", "F4", self.toggle_panels, vw)
+        self.hud_act = self.act("Show hints overlay", "H", lambda: self.v.hud.setVisible(self.hud_act.isChecked()), vw,
+                                checkable=True)
+        self.hud_act.setChecked(True)
+
+    def toggle_panels(self):
+        docks = (self.bodies_dock, self.props_dock)
+        show = not any(d.isVisible() for d in docks)
+        for d in docks:
+            d.setVisible(show)
+
+    def _build_toolbar(self):
+        tb = self.addToolBar("Tools")
+        tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        for key in ("select", "move", "points", "solid"):
+            a = self.tool_acts[key]
+            a.setToolTip("%s (%s)" % (TOOL_NAMES[key], a.shortcut().toString()))
+            tb.addAction(a)
+        tb.addSeparator()
+        tb.addAction(self.undo_act)
+        tb.addAction(self.redo_act)
+
+    # ----------------------------------------------------------- panel logic
     def pick_solid(self, key):
         self.v.solid_shape = key
         self.shape_cb.setCurrentIndex(SHAPES.index(key))
         if self.v.tool != "solid":
             self.v.set_tool("solid")
-            self.sync_checked()
+        self.update_panel()
         self.v.update_hud()
         self.v.update()
+
+    def sync_solid_controls(self):
+        """Show the viewer's solid settings in the panel (they change when a body's points are edited)."""
+        v = self.v
+        for w, fn in ((self.shape_cb, lambda: self.shape_cb.setCurrentIndex(SHAPES.index(v.solid_shape))),
+                      (self.seg_sp, lambda: self.seg_sp.setValue(v.solid_seg)),
+                      (self.sweep_mc, lambda: self.sweep_mc.setCurrentIndex(0 if v.sweep_mode == "linear" else 1)),
+                      (self.sweep_st, lambda: self.sweep_st.setValue(v.sweep_lseg))):
+            w.blockSignals(True); fn(); w.blockSignals(False)
+        self.update_panel()
 
     def sync_checked(self):
         self.tool_acts[self.v.tool].setChecked(True)
@@ -1030,91 +1449,195 @@ class MainWindow(QMainWindow):
         self.follow_cb.blockSignals(True)
         self.follow_cb.setChecked(self.v.follow)
         self.follow_cb.blockSignals(False)
+        self.update_panel()
+
+    def update_panel(self, *_):
+        """Show only the controls that matter for the current tool, mode and selection."""
+        v = self.v
+        edit = v.tool in ("select", "move")
+        has_sel = bool(v.sel)
+        self.p_title.setText(TOOL_NAMES[v.tool])
+        self.sec_sel.setVisible(edit)
+        self.sec_points.setVisible(v.tool == "points")
+        self.sec_solid.setVisible(v.tool == "solid")
+        if edit:
+            for k, b in self.mode_btns.items():
+                b.blockSignals(True); b.setChecked(v.mode == k); b.blockSignals(False)
+            self.pos_box.setVisible(bool(v.sel_verts()))
+            self.move_opts.setVisible(v.tool == "move")
+            self.follow_sub.setVisible(v.follow)
+            self.ops_box.setVisible(has_sel)
+            for btn, modes in self.op_btns:
+                btn.setVisible(v.mode in modes)
+        two = False
+        if edit and len(v.sel) >= 2:
+            try:
+                two = len(v.boolean_shells()) >= 2
+            except Exception:
+                two = False
+        self.sec_bool.setVisible(two)
+        if v.tool == "solid":
+            self.seg_row.setVisible(v.solid_shape in SEG_SHAPES)
+            self.sweep_box.setVisible(v.solid_shape in SWEEP_SHAPES)    # linear / fitted: loft + extrusion only
+
+    # ------------------------------------------------------------------ panel
+    def _group(self, title):
+        g = QGroupBox(title)
+        gl = QVBoxLayout(g)
+        gl.setContentsMargins(6, 4, 6, 6)
+        gl.setSpacing(4)
+        return g, gl
 
     def _build_dock(self):
-        dock = QDockWidget("Properties", self)
-        dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
+        self.props_dock = QDockWidget("Properties", self)
+        self.props_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
+                                    | QDockWidget.DockWidgetFeature.DockWidgetClosable)
         w = QWidget(); lay = QVBoxLayout(w)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(6)
+        self.p_title = QLabel()
+        self.p_title.setStyleSheet("font-weight:bold;font-size:13px;")
+        lay.addWidget(self.p_title)
 
-        g = QGroupBox("Point cloud"); gl = QVBoxLayout(g)
-        ps = QDoubleSpinBox(); ps.setRange(1, 20); ps.setValue(self.v.point_size)
-        ps.valueChanged.connect(lambda x: (setattr(self.v, "point_size", x), self.v.update()))
-        hc = QCheckBox("Color by height"); hc.setChecked(True)
-        hc.toggled.connect(lambda x: (setattr(self.v, "use_height_colors", x), self.v.update()))
-        sr = QSpinBox(); sr.setRange(3, 60); sr.setValue(int(self.v.snap_radius))
-        sr.valueChanged.connect(lambda x: setattr(self.v, "snap_radius", float(x)))
-        for lbl, wd in (("Point size", ps), ("Pick radius (px)", sr)):
-            r = QHBoxLayout(); r.addWidget(QLabel(lbl)); r.addWidget(wd); gl.addLayout(r)
-        gl.addWidget(hc); lay.addWidget(g)
+        # ---- combine solids: only while 2+ solids are selected
+        self.sec_bool, gl = self._group("Combine solids")
+        for text, kind in (("Union", "union"), ("Difference (first - others)", "difference"), ("Intersect", "intersect")):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _=False, k=kind: self.v.op_boolean(k))
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            gl.addWidget(b)
+        gl.addWidget(_small("The result goes into a folder in the Bodies list - use its Undo button to split it again."))
+        lay.addWidget(self.sec_bool)
 
-        g = QGroupBox("Surface"); gl = QVBoxLayout(g)
-        sl = QSlider(Qt.Orientation.Horizontal); sl.setRange(10, 100); sl.setValue(60)
-        sl.valueChanged.connect(lambda x: (setattr(self.v, "face_alpha", x / 100.0), setattr(self.v, "_arr", None), self.v.update()))
-        r = QHBoxLayout(); r.addWidget(QLabel("Opacity")); r.addWidget(sl); gl.addLayout(r)
+        # ---- select / move
+        self.sec_sel, gl = self._group("Selection")
+        row = QHBoxLayout(); row.setSpacing(2)
+        self.mode_btns, grp = {}, QButtonGroup(self)
+        for key, text, tip in (("v", "Vertex", "Vertex mode (1)"), ("e", "Edge", "Edge mode (2)"), ("f", "Face", "Face mode (3)")):
+            b = QToolButton(); b.setText(text); b.setToolTip(tip); b.setCheckable(True); b.setAutoRaise(False)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(lambda _=False, k=key: self.v.set_mode(k))
+            grp.addButton(b); row.addWidget(b); self.mode_btns[key] = b
+        gl.addLayout(row)
+        self.sel_lbl = QLabel("nothing selected")
+        gl.addWidget(self.sel_lbl)
+        self.pos_box = QWidget(); pl = QVBoxLayout(self.pos_box)
+        pl.setContentsMargins(0, 0, 0, 0); pl.setSpacing(2)
+        self.spins = []
+        for ax in "XYZ":
+            sp = QDoubleSpinBox(); sp.setRange(-1e12, 1e12); sp.setDecimals(4); sp.setSingleStep(0.1)
+            sp.setKeyboardTracking(False); sp.valueChanged.connect(self.coord_edited)
+            sp.setMinimumWidth(60)
+            self.spins.append(sp)
+            pl.addLayout(_row(ax, sp))
+        self.world_cb = QCheckBox("World coordinates")
+        self.world_cb.setToolTip("Show the position in the original coordinates of the point cloud")
+        self.world_cb.toggled.connect(self.refresh_coords)
+        pl.addWidget(self.world_cb)
+        gl.addWidget(self.pos_box)
+        self.move_opts = QWidget(); ml = QVBoxLayout(self.move_opts)      # move tool only
+        ml.setContentsMargins(0, 0, 0, 0); ml.setSpacing(3)
+        self.follow_cb = QCheckBox("Follow surface (C)")
+        self.follow_cb.toggled.connect(lambda x: (self.follow_act.setChecked(x), self.v.set_follow(x)))
+        ml.addWidget(self.follow_cb)
+        self.follow_sub = QWidget(); fl = QVBoxLayout(self.follow_sub)    # only while following is ticked
+        fl.setContentsMargins(14, 0, 0, 0); fl.setSpacing(2)
+        so = QDoubleSpinBox(); so.setRange(-1e9, 1e9); so.setDecimals(4); so.setSingleStep(0.05)
+        so.setToolTip("Height above the cloud surface while following it")
+        so.valueChanged.connect(lambda x: setattr(self.v, "surf_offset", x))
+        sk = QSpinBox(); sk.setRange(4, 400); sk.setValue(self.v.surf_k)
+        sk.setToolTip("Neighbouring cloud points averaged when following the surface (more = smoother)")
+        sk.valueChanged.connect(lambda x: setattr(self.v, "surf_k", x))
+        fl.addLayout(_row("Offset", so))
+        fl.addLayout(_row("Smoothing", sk))
+        ml.addWidget(self.follow_sub)
+        self.local_cb = QCheckBox("Aligned handles")
+        self.local_cb.setToolTip("On: handles align with the selected faces / edges / vertices "
+                                 "(blue Z = surface normal). Off: world X / Y / Z.")
+        self.local_cb.setChecked(self.v.local_axes)
+        self.local_cb.toggled.connect(lambda x: (setattr(self.v, "local_axes", x), self.v.update()))
+        ml.addWidget(self.local_cb)
+        gl.addWidget(self.move_opts)
+        self.ops_box = QWidget(); og = QGridLayout(self.ops_box)          # edit buttons: only what fits the mode
+        og.setContentsMargins(0, 2, 0, 0); og.setSpacing(3)
+        self.op_btns = []
+        for n, (text, meth, modes, tip) in enumerate(EDIT_OPS):
+            b = QPushButton(text); b.setToolTip(tip); b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(lambda _=False, m=meth: getattr(self.v, m)())
+            og.addWidget(b, n // 2, n % 2)
+            self.op_btns.append((b, modes))
+        gl.addWidget(self.ops_box)
+        lay.addWidget(self.sec_sel)
+
+        # ---- face from points
+        self.sec_points, gl = self._group("Options")
         an = QSpinBox(); an.setRange(0, 32); an.setValue(self.v.auto_n); an.setSpecialValueText("manual")
         an.valueChanged.connect(lambda x: (setattr(self.v, "auto_n", x), self.v.update_hud()))
-        r = QHBoxLayout(); r.addWidget(QLabel("Point-face: auto-finish at")); r.addWidget(an); gl.addLayout(r)
-        lay.addWidget(g)
+        gl.addLayout(_row("Finish after", an))
+        gl.addWidget(_small("Click cloud points. The face is made after that many clicks, or press Enter (manual)."))
+        lay.addWidget(self.sec_points)
 
-        g = QGroupBox("Solids (best fit)"); gl = QVBoxLayout(g)
+        # ---- best-fit solids
+        self.sec_solid, gl = self._group("Options")
         self.shape_cb = QComboBox()
         for key in SHAPES:
             self.shape_cb.addItem(SHAPE_NAMES[key], key)
         self.shape_cb.setCurrentIndex(SHAPES.index(self.v.solid_shape))
         self.shape_cb.activated.connect(lambda i: self.pick_solid(self.shape_cb.itemData(i)))
+        gl.addLayout(_row("Shape", self.shape_cb))
         sg = QSpinBox(); sg.setRange(8, 96); sg.setValue(self.v.solid_seg)
+        sg.setToolTip("Points around the shape (smoothness)")
         sg.valueChanged.connect(lambda x: (setattr(self.v, "solid_seg", x), self.v.update_hud(), self.v.update()))
-        for lbl, wd in (("Shape (B)", self.shape_cb), ("Segments", sg)):
-            r = QHBoxLayout(); r.addWidget(QLabel(lbl)); r.addWidget(wd); gl.addLayout(r)
-        gl.addWidget(QLabel("Click points on the object's surface,\nthen press Enter in the viewport."))
-        lay.addWidget(g)
+        self.seg_row = QWidget(); sl = QVBoxLayout(self.seg_row)          # box and plane have no round parts
+        sl.setContentsMargins(0, 0, 0, 0); sl.addLayout(_row("Segments", sg))
+        gl.addWidget(self.seg_row)
+        self.sweep_box = QWidget(); bl = QVBoxLayout(self.sweep_box)      # loft + extrusion only
+        bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(3)
+        mc = QComboBox()
+        mc.addItem("Linear", "linear")
+        mc.addItem("Fitted (curved)", "fitted")
+        mc.setCurrentIndex(0 if self.v.sweep_mode == "linear" else 1)
+        st = QSpinBox(); st.setRange(0, 200); st.setValue(self.v.sweep_lseg); st.setSpecialValueText("auto")
+        st.setToolTip("Segments along the length of the loft / extrusion")
+        def set_mode(i):
+            self.v.sweep_mode = mc.itemData(i)
+            self.v.update_hud(); self.v.update()
+        mc.activated.connect(set_mode)
+        st.valueChanged.connect(lambda x: (setattr(self.v, "sweep_lseg", x), self.v.update_hud(), self.v.update()))
+        bl.addLayout(_row("Type", mc))
+        bl.addLayout(_row("Along length", st))
+        gl.addWidget(self.sweep_box)
+        self.seg_sp, self.sweep_mc, self.sweep_st = sg, mc, st
+        gl.addWidget(_small("Click points on the object's surface, then press Enter."))
+        lay.addWidget(self.sec_solid)
 
-        g = QGroupBox("Surface following"); gl = QVBoxLayout(g)
-        self.follow_cb = QCheckBox("Follow cloud surface while moving (C)")
-        self.follow_cb.toggled.connect(lambda x: (self.follow_act.setChecked(x), self.v.set_follow(x)))
-        gl.addWidget(self.follow_cb)
-        so = QDoubleSpinBox(); so.setRange(-1e9, 1e9); so.setDecimals(4); so.setSingleStep(0.05)
-        so.valueChanged.connect(lambda x: setattr(self.v, "surf_offset", x))
-        sk = QSpinBox(); sk.setRange(4, 400); sk.setValue(self.v.surf_k)
-        sk.valueChanged.connect(lambda x: setattr(self.v, "surf_k", x))
-        for lbl, wd in (("Offset above surface", so), ("Neighbors (smoothing)", sk)):
-            r = QHBoxLayout(); r.addWidget(QLabel(lbl)); r.addWidget(wd); gl.addLayout(r)
-        lay.addWidget(g)
-
-        g = QGroupBox("Selection position"); gl = QVBoxLayout(g)
-        self.sel_lbl = QLabel("nothing selected"); gl.addWidget(self.sel_lbl)
-        self.spins = []
-        for ax in "XYZ":
-            sp = QDoubleSpinBox(); sp.setRange(-1e12, 1e12); sp.setDecimals(4); sp.setSingleStep(0.1)
-            sp.setKeyboardTracking(False); sp.valueChanged.connect(self.coord_edited)
-            self.spins.append(sp)
-            r = QHBoxLayout(); r.addWidget(QLabel(ax)); r.addWidget(sp); gl.addLayout(r)
-        self.world_cb = QCheckBox("Show original (world) coordinates")
-        self.world_cb.toggled.connect(self.refresh_coords)
-        gl.addWidget(self.world_cb)
-        self.local_cb = QCheckBox("Move handles follow selection orientation")
-        self.local_cb.setToolTip("On: handles align with the selected faces / edges / vertices "
-                                 "(blue Z = surface normal). Off: world X / Y / Z.")
-        self.local_cb.setChecked(self.v.local_axes)
-        self.local_cb.toggled.connect(lambda x: (setattr(self.v, "local_axes", x), self.v.update()))
-        gl.addWidget(self.local_cb); lay.addWidget(g)
-
-        g = QGroupBox("Operations"); gl = QVBoxLayout(g)
-        for text, fn in (("Subdivide (S)", self.v.op_subdivide), ("Extrude (E)", self.v.op_extrude),
-                         ("Fill face from verts (F)", self.v.op_fill), ("Weld verts (M)", self.v.op_weld),
-                         ("Flip normals (N)", self.v.op_flip), ("Snap to surface (Shift+S)", self.v.op_snap_surface),
-                         ("Delete (Del)", self.v.op_delete)):
-            b = QPushButton(text); b.clicked.connect(fn); b.setFocusPolicy(Qt.FocusPolicy.NoFocus); gl.addWidget(b)
-        lay.addWidget(g)
+        # ---- display (rarely changed -> folded away)
+        disp = Section("Display", collapsed=True)
+        ps = QDoubleSpinBox(); ps.setRange(1, 20); ps.setValue(self.v.point_size)
+        ps.valueChanged.connect(lambda x: (setattr(self.v, "point_size", x), self.v.update()))
+        sr = QSpinBox(); sr.setRange(3, 60); sr.setValue(int(self.v.snap_radius))
+        sr.setToolTip("How close (in pixels) a click must be to a cloud point to pick it")
+        sr.valueChanged.connect(lambda x: setattr(self.v, "snap_radius", float(x)))
+        hc = QCheckBox("Color points by height"); hc.setChecked(True)
+        hc.toggled.connect(lambda x: (setattr(self.v, "use_height_colors", x), self.v.update()))
+        sl_ = QSlider(Qt.Orientation.Horizontal); sl_.setRange(10, 100); sl_.setValue(int(self.v.face_alpha * 100))
+        sl_.valueChanged.connect(lambda x: (setattr(self.v, "face_alpha", x / 100.0), setattr(self.v, "_arr", None), self.v.update()))
+        disp.body_lay.addLayout(_row("Point size", ps))
+        disp.body_lay.addLayout(_row("Pick radius", sr))
+        disp.body_lay.addWidget(hc)
+        disp.body_lay.addLayout(_row("Opacity", sl_))
+        lay.addWidget(disp)
         lay.addStretch(1)
+
         sa = QScrollArea()                    # the panel scrolls when the window is short
         sa.setWidgetResizable(True)
         sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         sa.setFrameShape(QScrollArea.Shape.NoFrame)
         sa.setWidget(w)
-        sa.setMinimumWidth(w.sizeHint().width() + 24)
-        dock.setWidget(sa)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        sa.setMinimumWidth(190)
+        self.props_dock.setWidget(sa)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.props_dock)
 
     # -- coordinate panel
     def _off(self):

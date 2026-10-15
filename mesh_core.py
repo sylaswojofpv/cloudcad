@@ -148,9 +148,10 @@ def _merge_faces(f1, f2, a, b):
 
 
 class Mesh:
-    def __init__(self, V=None, F=None):
+    def __init__(self, V=None, F=None, T=None):
         self.V = np.zeros((0, 3)) if V is None else np.asarray(V, float).reshape(-1, 3)
         self.F = [] if F is None else [[int(i) for i in f] for f in F]
+        self.T = [-1] * len(self.F) if T is None or len(T) != len(self.F) else [int(t) for t in T]   # body id per face
         self._tri = None
 
     # ---- basics
@@ -161,7 +162,7 @@ class Mesh:
         return cls(c + np.array([[-h, -h, 0], [h, -h, 0], [h, h, 0], [-h, h, 0]]), [[0, 1, 2, 3]])
 
     def copy(self):
-        return Mesh(self.V.copy(), [f[:] for f in self.F])
+        return Mesh(self.V.copy(), [f[:] for f in self.F], self.T[:])
 
     def touch(self):
         self._tri = None
@@ -171,8 +172,9 @@ class Mesh:
         self._tri = None
         return len(self.V) - 1
 
-    def add_face(self, idx):
+    def add_face(self, idx, tag=-1):
         self.F.append([int(i) for i in idx])
+        self.T.append(int(tag))
         self._tri = None
         return len(self.F) - 1
 
@@ -227,7 +229,7 @@ class Mesh:
                 mid[k] = addv((self.V[a] + self.V[b]) / 2.0)
             return mid[k]
 
-        sub = []
+        sub, subT = [], []
         for fi in sorted(S):
             f = self.F[fi]
             n = len(f)
@@ -235,10 +237,12 @@ class Mesh:
             m = [midpoint(f[i], f[(i + 1) % n]) for i in range(n)]
             for i in range(n):
                 sub.append([f[i], m[i], c, m[i - 1]])
-        keep = []
+                subT.append(self.T[fi])
+        keep, keepT = [], []
         for fi, f in enumerate(self.F):
             if fi in S:
                 continue
+            keepT.append(self.T[fi])
             g, n = [], len(f)
             for i in range(n):
                 a, b = f[i], f[(i + 1) % n]
@@ -248,6 +252,7 @@ class Mesh:
                     g.append(mid[k])
             keep.append(g)
         self.F = keep + sub
+        self.T = keepT + subT
         if new:
             self.V = np.vstack([self.V, np.array(new)])
         self._tri = None
@@ -265,7 +270,7 @@ class Mesh:
                 a, b = f[i], f[(i + 1) % len(f)]
                 k = (min(a, b), max(a, b))
                 cnt[k] = cnt.get(k, 0) + 1
-                directed.append((a, b, k))
+                directed.append((a, b, k, fi))
         vn = {}
         for fi in S:
             n = self.face_normal(fi)
@@ -280,9 +285,10 @@ class Mesh:
             new.append(self.V[v] + n * dist)
         for fi in S:
             self.F[fi] = [remap[v] for v in self.F[fi]]
-        for a, b, k in directed:
+        for a, b, k, fi in directed:
             if cnt[k] == 1:
                 self.F.append([a, b, remap[b], remap[a]])
+                self.T.append(self.T[fi])
         self.V = np.vstack([self.V, np.array(new)])
         self._tri = None
         return list(remap.values())
@@ -295,8 +301,9 @@ class Mesh:
         items, lens = [], []
         for (a, b) in edges:
             fs = ef.get((a, b), [])
-            p, q, n = a, b, fb
+            p, q, n, tg = a, b, fb, -1
             if fs:
+                tg = self.T[fs[0]]
                 f = self.F[fs[0]]
                 n = self.face_normal(fs[0])
                 for i in range(len(f)):
@@ -308,10 +315,10 @@ class Mesh:
             d = np.cross(e, n)
             if np.linalg.norm(d) < 1e-12:
                 d = np.cross(e, [1.0, 0.0, 0.0])
-            items.append((p, q, d / (np.linalg.norm(d) + 1e-12)))
+            items.append((p, q, d / (np.linalg.norm(d) + 1e-12), tg))
         L = dist if dist else 0.5 * float(np.mean(lens))
         vdir = {}
-        for p, q, d in items:
+        for p, q, d, _ in items:
             for v in (p, q):
                 vdir[v] = vdir.get(v, 0) + d
         base, remap, new = len(self.V), {}, []
@@ -322,8 +329,9 @@ class Mesh:
             new.append(self.V[v] + d * L)
         self.V = np.vstack([self.V, np.array(new)])
         nf, ne = [], []
-        for p, q, d in items:
+        for p, q, d, tg in items:
             self.F.append([q, p, remap[p], remap[q]])
+            self.T.append(tg)
             nf.append(len(self.F) - 1)
             a, b = remap[p], remap[q]
             ne.append((min(a, b), max(a, b)))
@@ -332,13 +340,16 @@ class Mesh:
 
     def delete_faces(self, face_ids):
         S = set(face_ids)
+        self.T = [t for i, t in enumerate(self.T) if i not in S]
         self.F = [f for i, f in enumerate(self.F) if i not in S]
         self._tri = None
 
     def remove_vertices(self, drop):
         """Remove vertices and every face using them. Returns old->new index map."""
         drop = set(drop)
-        self.F = [f for f in self.F if not (set(f) & drop)]
+        alive = [not (set(f) & drop) for f in self.F]
+        self.T = [t for t, a in zip(self.T, alive) if a]
+        self.F = [f for f, a in zip(self.F, alive) if a]
         keep = [i for i in range(len(self.V)) if i not in drop]
         mp = {old: new for new, old in enumerate(keep)}
         self.F = [[mp[v] for v in f] for f in self.F]
@@ -415,6 +426,7 @@ class Mesh:
     def _compact(self, F, alive, drop):
         keep = [i for i in range(len(self.V)) if i not in drop]
         mp = {old: new for new, old in enumerate(keep)}
+        self.T = [self.T[k] for k in range(len(F)) if alive[k]]
         self.F = [[mp[v] for v in f] for k, f in enumerate(F) if alive[k]]
         self.V = self.V[keep]
         self._tri = None
@@ -506,8 +518,8 @@ class Mesh:
         keep = vs[0]
         self.V[keep] = self.V[vs].mean(0)
         m = {v: keep for v in vs[1:]}
-        newF = []
-        for f in self.F:
+        newF, newT = [], []
+        for fi, f in enumerate(self.F):
             h = []
             for v in (m.get(v, v) for v in f):
                 if not h or h[-1] != v:
@@ -516,7 +528,9 @@ class Mesh:
                 h.pop()
             if len(h) >= 3 and len(set(h)) == len(h):
                 newF.append(h)
+                newT.append(self.T[fi])
         self.F = newF
+        self.T = newT
         mp = self.remove_vertices(set(m))
         return mp[keep]
 
@@ -533,7 +547,7 @@ class Mesh:
 
     # ---- file io
     def to_dict(self, origin):
-        return {"origin": list(map(float, origin)), "vertices": self.V.tolist(), "faces": self.F}
+        return {"origin": list(map(float, origin)), "vertices": self.V.tolist(), "faces": self.F, "tags": self.T}
 
     def export_obj(self, path, offset):
         with open(path, "w") as fh:
@@ -544,15 +558,18 @@ class Mesh:
                 fh.write("f " + " ".join(str(i + 1) for i in f) + "\n")
 
 
-def save_model(path, mesh, origin):
+def save_model(path, mesh, origin, extra=None):
+    d = mesh.to_dict(origin)
+    if extra:
+        d.update(extra)
     with open(path, "w") as fh:
-        json.dump(mesh.to_dict(origin), fh)
+        json.dump(d, fh)
 
 
 def load_model(path):
     with open(path) as fh:
         d = json.load(fh)
-    return Mesh(np.array(d["vertices"], float), d["faces"]), np.array(d.get("origin", [0, 0, 0]), float)
+    return Mesh(np.array(d["vertices"], float), d["faces"], d.get("tags")), np.array(d.get("origin", [0, 0, 0]), float)
 
 
 # ===================================================================== camera ==

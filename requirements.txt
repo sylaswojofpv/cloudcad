@@ -2,3 +2,4 @@ PySide6
 PyOpenGL
 numpy
 scipy
+manifold3d
