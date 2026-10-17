@@ -13,12 +13,12 @@ import traceback
 from collections import Counter
 import numpy as np
 
-from PySide6.QtCore import Qt, Signal, QEventLoop, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QSurfaceFormat
+from PySide6.QtCore import Qt, Signal, QEventLoop, QTimer, QRectF, QPointF
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QSurfaceFormat, QPainter, QColor, QFont, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QFileDialog, QDockWidget, QWidget,
                                QVBoxLayout, QHBoxLayout, QGroupBox, QLabel, QDoubleSpinBox,
                                QSpinBox, QCheckBox, QSlider, QPushButton, QMessageBox, QComboBox, QScrollArea,
-                               QToolButton, QSizePolicy, QButtonGroup, QGridLayout)
+                               QToolButton, QSizePolicy, QButtonGroup, QGridLayout, QListWidget)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 
@@ -29,17 +29,36 @@ from solids import SHAPES, SHAPE_NAMES, MIN_POINTS, SWEEP_SHAPES, fit_solid
 from booleans import shells_of, boolean_op, replace_faces, split_loose
 from bodies import Registry, OP_NAMES, extract_faces, geom_sig
 from bodies_panel import BodiesPanel
+from reconstruct import poisson_mesh, points_in_polygon
+from measure import build as meas_build, from_clicks, fit_round, selection_info, ray_segment_closest, TITLES as MEAS_TITLES
 
 MAX_DISPLAY = 3_000_000   # points actually drawn (stride-decimated above this)
 MAX_SNAP = 400_000        # points tested during hover / drag snapping
 TOOLS = {"select": "Select", "move": "Move / Transform", "points": "Face from cloud points",
-         "solid": "Solid (best fit)"}
+         "solid": "Solid (best fit)", "mesh": "Mesh from points (Poisson)", "measure": "Measure"}
+MEAS_MODES = ("distance", "path", "angle", "circle", "sphere", "edge", "faceangle")
+MEAS_LABELS = {"distance": "Distance (2 points)", "path": "Path length (many points)", "angle": "Angle (3 points)",
+               "circle": "Diameter / radius (circle)", "sphere": "Diameter (sphere)", "edge": "Edge length",
+               "faceangle": "Angle between faces"}
+MEAS_AUTO = {"distance": 2, "angle": 3, "faceangle": 2}                  # picks that complete a measurement by themselves
+MEAS_MIN = {"distance": 2, "path": 2, "angle": 3, "circle": 3, "sphere": 4, "faceangle": 2}
+MEAS_HELP = {
+    "distance": "Click two points: cloud points, shape vertices, points on edges (midpoints snap) or on faces, or the center of a measured circle / sphere. Ctrl = cloud points only.",
+    "path": "Click points along the path, then press Enter. Gives the total length.",
+    "angle": "Click three points - the middle one is the corner of the angle.",
+    "circle": "Click 3 or more points on a circle or rim, then press Enter. A circle is fitted to all of them, and its center becomes a point you can measure from.",
+    "sphere": "Click 4 or more points all around a sphere, then press Enter. A sphere is fitted to all of them, and its center becomes a point you can measure from.",
+    "edge": "Click a mesh edge to get its length.",
+    "faceangle": "Click two faces of a shape to get the angle between them.",
+}
+MEAS_SYMBOL = {"Diameter": "Ø ", "Radius": "R "}
 MODES = {"v": "Vertex", "e": "Edge", "f": "Face"}
 HINTS = {
     "select": "Click to pick (Shift = add/remove)",
     "move": "Drag a handle or element. X/Y/Z lock axis, Ctrl = snap to cloud, Esc cancels",
     "points": "Click cloud points (Ctrl = ignore mesh verts). Enter = make face, Backspace = undo point, Esc = cancel",
     "solid": "Click points on the object's surface - more points = better fit. Enter = create, Backspace = undo point, Esc = cancel",
+    "mesh": "Drag a loop (lasso) around cloud points to build a mesh (Shift = add to selection). Change detail in the panel. Enter = add to model, Esc = clear",
 }
 SOLID_HINTS = {
     "plane": "Click points on the flat surface (3+). Enter = create, Backspace = undo point, Esc = cancel",
@@ -55,10 +74,57 @@ def height_colors(z):
     return np.ascontiguousarray(np.stack([np.interp(t, stops, cols[:, i]) for i in range(3)], 1).astype(np.uint8))
 
 
+class MeasureOverlay(QWidget):
+    """Transparent layer over the viewport that writes the measurement labels (the lines are drawn by OpenGL)."""
+
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self.v = viewer
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+    def paintEvent(self, e):
+        v = self.v
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if v.meas_show:
+                for i, m in enumerate(v.measures):
+                    hot = i == v.meas_sel
+                    self._label(p, m["res"]["anchor"], v.meas_label_lines(m["res"], hot or v.meas_details), hot, False)
+            live = v.meas_live()
+            if live is not None:
+                self._label(p, live[0], live[1], True, True)
+        finally:
+            p.end()
+
+    def _label(self, p, world, lines, hot, live):
+        cam = self.v.cam
+        sx, sy, _, w = cam.project(np.asarray(world, float)[None, :])
+        if not np.isfinite(sx[0]) or not np.isfinite(sy[0]) or w[0] <= cam.near:
+            return
+        f = QFont(self.font())
+        f.setPointSize(9)
+        f.setBold(True)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        wd = max(fm.horizontalAdvance(t) for t in lines) + 14
+        ht = fm.height() * len(lines) + 8
+        x, y = float(sx[0]) - wd / 2, float(sy[0]) - ht - 10
+        p.setBrush(QColor(20, 22, 26, 225))
+        p.setPen(QPen(QColor(255, 255, 255) if hot else (QColor(255, 220, 60) if live else QColor(255, 110, 200)), 1.5))
+        p.drawRoundedRect(QRectF(x, y, wd, ht), 5, 5)
+        p.setPen(QColor(240, 244, 248))
+        for k, t in enumerate(lines):
+            p.drawText(QPointF(x + 7, y + 4 + fm.ascent() + k * fm.height()), t)
+
+
 class Viewer(QOpenGLWidget):
     status = Signal(str)
     selection_changed = Signal()
     state_changed = Signal()
+    measures_changed = Signal()    # the list of measurements (or how they are shown) changed
     bodies_changed = Signal()      # the Bodies list needs a refresh
 
     def __init__(self):
@@ -91,6 +157,21 @@ class Viewer(QOpenGLWidget):
         self.reg = Registry()    # bodies + boolean folders (see bodies.py)
         self.clouds = []         # loaded point clouds: dicts name / pts (local float32) / visible
         self.editing = None      # id of the body whose points are being edited
+        # measurements
+        self.measures = []                       # dicts: kind, pts (local coords), note, res (built numbers + lines)
+        self.meas_kind, self.meas_sel, self.meas_hover = "distance", None, None
+        self.meas_show, self.meas_details = True, False
+        self.meas_units, self.meas_scale, self.meas_dec = "", 1.0, 3
+        self.cloud_ext = None                    # size of the visible cloud
+        self._edge_key, self._edge_arr = None, None
+        # mesh from points (Poisson)
+        self.mp_pts, self.mp_preview, self.mp_lines, self.mp_info = None, None, None, ""
+        self.mp_detail, self.mp_max_tris, self.mp_trim, self.mp_orient = 8, 50_000, True, "auto"
+        self.lasso, self.lasso_w, self.lasso_on, self.lasso_add = [], [], False, False
+        self._mp_timer = QTimer(self)            # rebuild the preview shortly after a setting stops changing
+        self._mp_timer.setSingleShot(True)
+        self._mp_timer.setInterval(350)
+        self._mp_timer.timeout.connect(self.build_mp_preview)
         # interaction state
         self.pending, self.drag, self.nav = [], None, None
         self.axis_lock, self.snap, self.hover_axis = None, None, None
@@ -103,7 +184,16 @@ class Viewer(QOpenGLWidget):
         self.hud.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.hud.setStyleSheet("color:#dfe6ee;background:rgba(20,22,26,150);padding:6px;border-radius:4px;")
         self.hud.move(8, 8)
+        self.overlay = MeasureOverlay(self)
+        self.overlay.setGeometry(self.rect())
+        self.hud.raise_()
         self.update_hud()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "overlay"):
+            self.overlay.setGeometry(0, 0, self.width(), self.height())
+            self.hud.raise_()
 
     # ------------------------------------------------------------ state helpers
     def changed(self):
@@ -123,11 +213,23 @@ class Viewer(QOpenGLWidget):
             extra = "  [%d/%s]" % (len(self.pending), self.auto_n or "manual")
         elif self.tool == "solid":
             extra = "  [%s: %d pts%s]" % (SHAPE_NAMES[self.solid_shape], len(self.pending), self.solid_info)
+        elif self.tool == "measure":
+            extra = "  [%s: %d picked]" % (self.meas_kind, len(self.pending))
+        elif self.tool == "mesh":
+            extra = "  [%s pts selected%s]" % (format(0 if self.mp_pts is None else len(self.mp_pts), ","),
+                                              "" if self.mp_preview is None else ", %s triangles" % format(len(self.mp_preview[1]), ","))
         self.hud.setText("<b>%s</b>   |   select: %s%s<br><span style='color:#9fb0c3'>%s<br>"
                          "MMB orbit · Shift+MMB / RMB pan · wheel zoom · Home frame</span>"
                          % (TOOLS[self.tool], MODES[self.mode], extra + ("  |  follow surface ON" if self.follow else ""),
-                            SOLID_HINTS.get(self.solid_shape, HINTS["solid"]) if self.tool == "solid" else HINTS[self.tool]))
+                            self.hint_text()))
         self.hud.adjustSize()
+
+    def hint_text(self):
+        if self.tool == "solid":
+            return SOLID_HINTS.get(self.solid_shape, HINTS["solid"])
+        if self.tool == "measure":
+            return MEAS_HELP[self.meas_kind] + " Enter = finish, Backspace = undo point, Esc = cancel"
+        return HINTS[self.tool]
 
     def msg(self, s):
         self.status.emit(s)
@@ -152,23 +254,55 @@ class Viewer(QOpenGLWidget):
         self.bodies_changed.emit()
         self.update_hud()
 
+    # The redo stack holds snapshots (mesh edits) and small dicts (a picked point / a clicked selection that was
+    # taken back). Those small entries only apply while the state is exactly as the undo left it; otherwise they are dropped.
+    def _pend_token(self):
+        return tuple(tuple(np.round(np.asarray(p[2], float), 9)) for p in self.pending)
+
+    def _sel_token(self):
+        return (frozenset(self.sel), tuple(self.sel_trail))
+
+    def undo_pick(self):
+        """Take back the last picked point (redoable)."""
+        pt = self.pending.pop()
+        self.redo.append(dict(kind="pend", tool=self.tool, pt=pt, token=self._pend_token()))
+        self.update_hud(); self.update(); self.state_changed.emit()
+
     def do_undo(self):
         if self.pending:                      # 1) un-pick the last cloud point
-            self.pending.pop()
-            self.update_hud(); self.update()
-            return
+            return self.undo_pick()
         trail = [i for i in self.sel_trail if i in self.sel]
         if trail:                             # 2) un-select the last clicked element
             self.sel.discard(trail[-1])
             self.sel_trail = trail[:-1]
+            self.redo.append(dict(kind="sel", mode=self.mode, item=trail[-1], token=self._sel_token()))
             self._arr = None
             self.update(); self.selection_changed.emit()
             return
-        if self.undo:                         # 3) otherwise: normal undo, unchanged
+        if self.undo:                         # 3) otherwise: normal undo
             self.redo.append(self.snapshot())
             self.restore(self.undo.pop())
 
+    def _redo_small(self, e):
+        """Redo a taken-back pick / selection if nothing else changed since. -> True when it was applied."""
+        if e["kind"] == "pend":
+            if self.tool != e["tool"] or self._pend_token() != e["token"]:
+                return False
+            self.pending.append(e["pt"])
+            self.update_hud(); self.update(); self.state_changed.emit()
+            return True
+        if self.mode != e["mode"] or self._sel_token() != e["token"]:
+            return False
+        self.sel.add(e["item"])
+        self.sel_trail.append(e["item"])
+        self._arr = None
+        self.update(); self.selection_changed.emit()
+        return True
+
     def do_redo(self):
+        while self.redo and isinstance(self.redo[-1], dict):     # picks / clicked selections first (most recent undo)
+            if self._redo_small(self.redo.pop()):
+                return
         if self.redo:
             self.undo.append(self.snapshot())
             self.restore(self.redo.pop())
@@ -206,6 +340,398 @@ class Viewer(QOpenGLWidget):
         self.changed(); self.update_hud(); self.selection_changed.emit(); self.state_changed.emit()
         self.bodies_changed.emit()
         self.msg("%s created. Drag it, or select faces / vertices to move and extrude (E)" % SHAPE_NAMES[self.solid_shape])
+
+    # ------------------------------------------------------------------ measuring
+    def meas_fmt(self, v, t):
+        """A measured value as text: lengths x scale, with the unit name; areas and volumes scale accordingly."""
+        s, d, u = self.meas_scale, self.meas_dec, self.meas_units
+        if t == "deg":
+            return "%.*f°" % (min(d, 4), v)
+        if t == "int":
+            return "%d" % v
+        k = {"len": 1, "area": 2, "vol": 3}[t]
+        return "%.*f%s" % (d, v * s ** k, (" " + u + ("", "²", "³")[k - 1]) if u else "")
+
+    def meas_label_lines(self, res, detail):
+        """Text of a label: the main value, plus every other value when detail is on."""
+        n0, v0, t0 = res["items"][0]
+        lines = [MEAS_SYMBOL.get(n0, "") + self.meas_fmt(v0, t0)]
+        if detail:
+            lines += ["%s: %s" % (n, self.meas_fmt(v, t)) for n, v, t in res["items"][1:]]
+        return lines
+
+    def measure_summary(self, i, full=False):
+        m = self.measures[i]
+        items = m["res"]["items"]
+        use = items if full else items[:1]
+        s = "%s: %s" % (m["res"]["title"], ", ".join("%s %s" % (n, self.meas_fmt(v, t)) if full else self.meas_fmt(v, t)
+                                                      for n, v, t in use))
+        return s + ("  [%s]" % m["note"] if full and m["note"] else "")
+
+    def set_meas_kind(self, k):
+        if k in MEAS_MODES and k != self.meas_kind:
+            self.meas_kind = k
+            self.pending.clear()
+            self.snap, self.meas_hover = None, None
+        self.update_hud(); self.update(); self.state_changed.emit()
+
+    def set_meas_sel(self, i):
+        self.meas_sel = i if (i is not None and 0 <= i < len(self.measures)) else None
+        self.update()
+
+    def set_meas_format(self, units=None, scale=None, dec=None, show=None, details=None):
+        if units is not None:
+            self.meas_units = units
+        if scale is not None:
+            self.meas_scale = float(scale)
+        if dec is not None:
+            self.meas_dec = int(dec)
+        if show is not None:
+            self.meas_show = bool(show)
+        if details is not None:
+            self.meas_details = bool(details)
+        self.measures_changed.emit()
+        self.state_changed.emit()
+        self.update()
+
+    def add_measure(self, kind, pts, note=""):
+        """Store a measurement. Raises ValueError (readable) when it can't be built."""
+        res = meas_build(kind, pts)
+        self.measures.append(dict(kind=kind, pts=np.asarray(pts, float).reshape(-1, 3).copy(), note=note, res=res))
+        self.meas_sel = len(self.measures) - 1
+        self.update_hud(); self.update(); self.measures_changed.emit(); self.state_changed.emit()
+        extra = ("  -  center point added: click it to measure from it" if len(res["points"]) == 1 else
+                 "  -  center points added: click them to measure from them") if res["points"] else ""
+        self.msg(self.measure_summary(self.meas_sel, full=True) + extra)
+
+    def delete_measure(self, i=None):
+        i = self.meas_sel if i is None else i
+        if i is None or not (0 <= i < len(self.measures)):
+            return self.msg("Select a measurement in the list first")
+        del self.measures[i]
+        self.meas_sel = min(i, len(self.measures) - 1) if self.measures else None
+        self.update(); self.measures_changed.emit()
+
+    def clear_measures(self):
+        self.measures, self.meas_sel = [], None
+        self.update(); self.measures_changed.emit()
+
+    def measures_text(self):
+        return "\n".join(self.measure_summary(i, full=True) for i in range(len(self.measures)))
+
+    def shift_measures(self, delta):
+        """The scene origin moved: move every measurement with it."""
+        delta = np.asarray(delta, float)
+        for m in self.measures:
+            m["pts"] = m["pts"] + delta
+            m["res"] = meas_build(m["kind"], m["pts"])
+
+    def measures_to_json(self):
+        return [dict(kind=m["kind"], pts=m["pts"].tolist(), note=m["note"]) for m in self.measures]
+
+    def measures_from_json(self, data, shift):
+        self.measures, self.meas_sel = [], None
+        for d in data or []:
+            try:
+                pts = np.array(d["pts"], float).reshape(-1, 3) + shift
+                self.measures.append(dict(kind=d["kind"], pts=pts, note=d.get("note", ""), res=meas_build(d["kind"], pts)))
+            except (ValueError, KeyError):
+                continue
+
+    # --- snapping: cloud points, shape vertices, points on edges / faces
+    def mesh_edges(self):
+        """All mesh edges as an (E, 2) array (cached until the mesh changes)."""
+        tri = self.mesh.triangulate()[0]
+        if self._edge_key is not tri:
+            self._edge_arr = np.array(list(self.mesh.edge_faces().keys()), int).reshape(-1, 2)
+            self._edge_key = tri
+        return self._edge_arr
+
+    def _pick_edge(self, x, y):
+        """-> (edge index, t along it, edge length in pixels) of the edge under the cursor, or None."""
+        E = self.mesh_edges()
+        if not len(E):
+            return None
+        sx, sy, _, w = self.cam.project(self.mesh.V)
+        S = np.c_[sx, sy]
+        A, B = S[E[:, 0]], S[E[:, 1]]
+        AB = B - A
+        p = np.array([x, y])
+        t = np.clip(((p - A) * AB).sum(1) / np.maximum((AB * AB).sum(1), 1e-12), 0, 1)
+        d = np.linalg.norm(A + AB * t[:, None] - p, axis=1)
+        d[(w[E[:, 0]] <= self.cam.near) | (w[E[:, 1]] <= self.cam.near)] = np.inf
+        i = int(np.argmin(d))
+        return (i, float(t[i]), float(np.linalg.norm(AB[i]))) if d[i] <= self.snap_radius else None
+
+    def _face_point(self, fi, x, y):
+        o, d = self.cam.ray(x, y)
+        f = self.mesh.F[fi]
+        p = ray_plane(o, d, self.mesh.V[f[0]], self.mesh.face_normal(fi))
+        return self.mesh.V[f].mean(0) if p is None else p
+
+    def derived_points(self):
+        """Points that measurements produced (circle / sphere centers, cylinder end centers) as an (N, 3) array.
+        They belong to their measurement: delete the measurement and they are gone. Hidden with the measurements."""
+        pts = [p for m in self.measures for _, p in m["res"]["points"]] if self.meas_show else []
+        return np.array(pts, float).reshape(-1, 3)
+
+    def find_measure_snap(self, x, y, ctrl=False, full=False):
+        """Best thing to measure from under the cursor: ('mesh'|'cloud'|'edge'|'face', index, position) or None."""
+        if not ctrl:                                       # centers produced by other measurements come first
+            P = self.derived_points()
+            if len(P):
+                sx, sy, _, w = self.cam.project(P)
+                d = np.hypot(sx - x, sy - y)
+                d[w <= self.cam.near] = np.inf
+                k = int(np.argmin(d))
+                if d[k] <= self.snap_radius:
+                    return ("center", k, P[k].copy())
+        sn = self.find_snap(x, y, full=full, cloud_only=ctrl)
+        if sn is not None or ctrl:
+            return sn
+        hit = self._pick_edge(x, y)
+        if hit is not None:
+            i, t, px = hit
+            a, b = self.mesh_edges()[i]
+            A, B = self.mesh.V[a], self.mesh.V[b]
+            if abs(t - 0.5) * px <= 0.6 * self.snap_radius:
+                return ("edge", i, (A + B) / 2)
+            o, d = self.cam.ray(x, y)
+            return ("edge", i, ray_segment_closest(o, d, A, B))
+        fi = pick_mesh_face(self.cam, self.mesh, x, y)
+        if fi is not None:
+            return ("face", fi, self._face_point(fi, x, y))
+        return None
+
+    def measure_hover(self, x, y, ctrl):
+        """Update the snap marker (and the highlighted edge in Edge mode) for the cursor position."""
+        self.snap, self.meas_hover = None, None
+        k = self.meas_kind
+        if k == "edge":
+            hit = self._pick_edge(x, y)
+            if hit is not None:
+                a, b = self.mesh_edges()[hit[0]]
+                self.meas_hover = (self.mesh.V[a].copy(), self.mesh.V[b].copy())
+        elif k == "faceangle":
+            fi = pick_mesh_face(self.cam, self.mesh, x, y)
+            if fi is not None:
+                self.snap = ("face", fi, self._face_point(fi, x, y))
+        else:
+            self.snap = self.find_measure_snap(x, y, ctrl, full=False)
+
+    def measure_click(self, x, y, ctrl):
+        k = self.meas_kind
+        if k == "edge":
+            hit = self._pick_edge(x, y)
+            if hit is None:
+                return self.msg("Click on a mesh edge")
+            a, b = self.mesh_edges()[hit[0]]
+            return self.add_measure("edge", [self.mesh.V[a], self.mesh.V[b]])
+        if k == "faceangle":
+            fi = pick_mesh_face(self.cam, self.mesh, x, y)
+            if fi is None:
+                return self.msg("Click on a face of a shape")
+            self.pending.append(("face", fi, self._face_point(fi, x, y)))
+        else:
+            sn = self.find_measure_snap(x, y, ctrl, full=True)
+            if sn is None:
+                return self.msg("Nothing to snap to here - click a cloud point, a shape's vertex, edge or face (Ctrl = cloud points only)")
+            self.pending.append(sn)
+        need = MEAS_AUTO.get(k)
+        if need and len(self.pending) >= need:
+            return self.finish_measure()
+        self.update_hud(); self.update(); self.state_changed.emit()
+        n, lo = len(self.pending), MEAS_MIN[k]
+        self.msg("%d point%s picked%s" % (n, "" if n == 1 else "s",
+                                          "" if n >= lo or k in MEAS_AUTO else " - need %d+, then Enter" % lo)
+                 if n < lo else "%d points picked - press Enter to finish (or keep clicking)" % n)
+
+    def finish_measure(self):
+        k, P = self.meas_kind, self.pending
+        if k == "edge" or not P:
+            return
+        if len(P) < MEAS_MIN[k]:
+            return self.msg("Pick at least %d points (%d so far)" % (MEAS_MIN[k], len(P)))
+        pts = np.array([p[2] for p in P], float)
+        try:
+            if k == "faceangle":
+                L = 0.1 * max(self.cam.radius, 1e-9)
+                n1, n2 = self.mesh.face_normal(P[0][1]), self.mesh.face_normal(P[1][1])
+                pts = np.array([pts[0], pts[0] + n1 * L, pts[1], pts[1] + n2 * L])
+            kind, pts, note = from_clicks(k, pts)
+            self.add_measure(kind, pts, note)
+        except ValueError as ex:
+            return self.msg(str(ex))                       # keep the picks so the user can add more points
+        self.pending = []
+        self.update_hud(); self.update(); self.state_changed.emit()
+
+    def meas_live(self):
+        """(anchor, label lines) of the measurement as it would be if the cursor position were picked next."""
+        if self.tool != "measure" or not self.pending or self.snap is None:
+            return None
+        if self.meas_kind not in ("distance", "path", "angle", "circle", "sphere"):
+            return None
+        try:
+            kind, pts, _ = from_clicks(self.meas_kind, [p[2] for p in self.pending] + [self.snap[2]])
+            res = meas_build(kind, pts)
+        except ValueError:
+            return None
+        return res["anchor"], self.meas_label_lines(res, False)
+
+    def fit_selection_diameter(self):
+        """Diameter of the selected shape: the best sphere or cylinder through its vertices and edge midpoints."""
+        fs = self.sel_faces()
+        vs = self.sel_verts()
+        if len(vs) < 6:
+            return self.msg("Select a round shape first (Select tool, Face mode, or click the body in the Bodies list)")
+        V, F = self.mesh.V, self.mesh.F
+        mid = {tuple(sorted((f[k], f[(k + 1) % len(f)]))) for i in fs for f in [F[i]] for k in range(len(f))}
+        P = V[vs]
+        if mid:
+            E = np.array(sorted(mid))
+            P = np.vstack([P, (V[E[:, 0]] + V[E[:, 1]]) / 2])   # edge midpoints: a box's corners alone fit a sphere
+        try:
+            cands = fit_round(P)
+        except ValueError as ex:
+            return self.msg(str(ex))
+        if not cands or cands[0]["rel"] > 0.06:
+            best = "" if not cands else " (best fit: %s, error %.0f%% of its radius)" % (cands[0]["kind"], 100 * cands[0]["rel"])
+            return self.msg("The selection doesn't look like a sphere or a cylinder%s. Use the circle measurement on its rim instead" % best)
+        b = cands[0]
+        try:
+            self.add_measure(b["kind"], b["pts"], "fitted to the selection, error %.1f%% of radius" % (100 * b["rel"]))
+        except ValueError as ex:
+            self.msg(str(ex))
+
+    def meas_selection_info(self):
+        vs = self.sel_verts()
+        return selection_info(self.mesh.V, self.mesh.F, self.sel_faces(), vs) if vs else None
+
+    def meas_info_text(self):
+        """Size of the selected shape and of the cloud, for the panel."""
+        f, lines = self.meas_fmt, []
+        info = self.meas_selection_info()
+        if info is None:
+            lines.append("Select a shape (Select tool or the Bodies list) to see its size here.")
+        else:
+            sz = info["size"]
+            lines.append("Selected: %d faces, %d vertices" % (info["n_faces"], info["n_verts"]))
+            lines.append("Size: %s × %s × %s" % tuple(f(s, "len") for s in sz))
+            lines.append("Diagonal: %s" % f(info["diagonal"], "len"))
+            if info["n_faces"]:
+                lines.append("Surface area: %s" % f(info["area"], "area"))
+                lines.append("Volume: %s" % (f(info["volume"], "vol") if info["volume"] is not None else "n/a (not a closed shape)"))
+        if self.cloud_ext is not None:
+            lines.append("Cloud size: %s × %s × %s" % tuple(f(s, "len") for s in self.cloud_ext))
+        return "\n".join(lines)
+
+    def _draw_measures(self, dpr):
+        if self.meas_hover is not None:                    # the edge that would be measured
+            glColor3f(1.0, 0.95, 0.2); glLineWidth(4.0 * dpr)
+            glBegin(GL_LINES); glVertex3f(*self.meas_hover[0]); glVertex3f(*self.meas_hover[1]); glEnd()
+        if not self.meas_show:
+            return
+        for i, m in enumerate(self.measures):
+            hot = i == self.meas_sel
+            col = (1.0, 1.0, 1.0) if hot else (1.0, 0.43, 0.78)
+            glColor3f(*col); glLineWidth((3.0 if hot else 2.0) * dpr)
+            for kind, P in m["res"]["prims"]:
+                glBegin(GL_LINE_LOOP if kind == "loop" else GL_LINE_STRIP)
+                for q in P:
+                    glVertex3f(*q)
+                glEnd()
+            self._pts(np.ascontiguousarray(m["pts"], np.float32), 8 if hot else 6, col)
+            for _, c in m["res"]["points"]:                # the center point(s) this measurement produced: a cross
+                w = float(self.cam.project(np.asarray(c, float)[None, :])[3][0])
+                if w <= self.cam.near:
+                    continue
+                s = self.cam.world_per_pixel(w) * 8.0
+                ccol = (1.0, 1.0, 1.0) if hot else (1.0, 0.78, 0.2)
+                glColor3f(*ccol); glLineWidth(2.0 * dpr)
+                glBegin(GL_LINES)
+                for ax in np.eye(3):
+                    glVertex3f(*(c - ax * s)); glVertex3f(*(c + ax * s))
+                glEnd()
+                self._pts(np.asarray(c, np.float32)[None, :], 9, ccol)
+
+    # --------------------------------------------------- mesh from points (Poisson)
+    def mp_clear(self):
+        self.mp_pts = self.mp_preview = self.mp_lines = None
+        self.mp_info = ""
+        self.lasso, self.lasso_w, self.lasso_on = [], [], False
+        self._mp_timer.stop()
+
+    def _lasso_world(self, x, y):
+        """Where a lasso point sits in space (on the plane through the view target) - only used to draw the loop."""
+        o, d = self.cam.ray(x, y)
+        p = ray_plane(o, d, self.cam.target, self.cam.forward())
+        return o + d * self.cam.dist if p is None else p
+
+    def finish_lasso(self):
+        poly, add = np.array(self.lasso, float), self.lasso_add
+        self.lasso, self.lasso_w, self.lasso_on = [], [], False
+        self.update()
+        if len(poly) < 3:
+            return self.msg("Drag a loop around the cloud points to build a mesh from")
+        if self.cloud_full is None:
+            return self.msg("Load a point cloud first (and make sure it is visible)")
+        pts = self.cloud_full
+        sx, sy, _, w = self.cam.project(pts)
+        box = ((sx >= poly[:, 0].min()) & (sx <= poly[:, 0].max()) & (sy >= poly[:, 1].min())
+               & (sy <= poly[:, 1].max()) & (w > self.cam.near))
+        idx = np.flatnonzero(box)
+        if idx.size:
+            idx = idx[points_in_polygon(np.c_[sx[idx], sy[idx]], poly)]
+        if idx.size < 30:
+            return self.msg("Only %d points inside the loop - lasso more of the cloud (30+ needed)" % idx.size)
+        sel = pts[idx].astype(np.float64)
+        if add and self.mp_pts is not None:
+            sel = np.unique(np.vstack([self.mp_pts, sel]), axis=0)
+        self.mp_pts, self.mp_eye = sel, self.cam.eye()
+        self.build_mp_preview()
+
+    def schedule_mp(self):
+        """A setting changed: rebuild the preview once things settle (only if points are selected)."""
+        if self.mp_pts is not None:
+            self._mp_timer.start()
+
+    def build_mp_preview(self):
+        if self.mp_pts is None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.msg("Building mesh from %s points..." % format(len(self.mp_pts), ","))
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            V, F, info = poisson_mesh(self.mp_pts, self.mp_detail, self.mp_max_tris, self.mp_trim,
+                                      getattr(self, "mp_eye", None), self.mp_orient)
+        except (ValueError, ImportError) as ex:
+            self.mp_preview = self.mp_lines = None
+            self.update_hud(); self.update(); self.state_changed.emit()
+            return self.msg(str(ex))
+        finally:
+            QApplication.restoreOverrideCursor()
+        Fa = np.asarray(F, int)
+        E = np.sort(np.concatenate([Fa[:, [0, 1]], Fa[:, [1, 2]], Fa[:, [2, 0]]]), axis=1)
+        E = np.unique(E, axis=0)
+        self.mp_preview, self.mp_info = (V, F), info
+        self.mp_lines = np.ascontiguousarray(V[E].reshape(-1, 3), np.float32)
+        self.update_hud(); self.update(); self.state_changed.emit()
+        self.msg(info + "  -  Enter / 'Add mesh to model' keeps it; change Detail to refine")
+
+    def commit_mp(self):
+        if self.mp_preview is None:
+            return self.msg("Lasso some cloud points first")
+        V, F = self.mp_preview
+        self.sync_bodies()
+        self.push_undo()
+        body = self.reg.new_body("Poisson mesh", "mesh")
+        replace_faces(self.mesh, [], V, F, tag=body.id)
+        n = len(F)
+        self.mp_clear()
+        self.mode, self.sel, self.tool = "f", set(), "move"
+        self.changed(); self.update_hud(); self.selection_changed.emit(); self.state_changed.emit()
+        self.bodies_changed.emit()
+        self.msg("Mesh added (%s triangles). Select it in the Bodies list to move or edit it; flip normals with N" % format(n, ","))
 
     # ------------------------------------------------------------- bodies list
     def sync_bodies(self):
@@ -409,6 +935,9 @@ class Viewer(QOpenGLWidget):
             self.editing = None
         self.pending.clear()
         self.drag = None
+        self.snap, self.meas_hover = None, None
+        if t != "mesh":
+            self.mp_clear()
         self.update_hud()
         self.update()
         self.state_changed.emit()
@@ -591,6 +1120,7 @@ class Viewer(QOpenGLWidget):
             c["pts"] = (c["pts"].astype(np.float64) + delta).astype(np.float32)
         self.mesh.V = self.mesh.V + delta                  # keep existing model aligned
         self.reg.shift(delta)
+        self.shift_measures(delta)
         taken = {c["name"] for c in self.clouds}
         for name, a in loaded:
             base, n = name, 2
@@ -603,6 +1133,9 @@ class Viewer(QOpenGLWidget):
             self.mesh = Mesh.plane((0, 0, 0), max(0.4 * max(ext[0], ext[1]), 1e-3))
             self.reg = Registry()
             self.sel = set()
+            if not append:                                 # a fresh start: old measurements belong to the old cloud
+                self.measures, self.meas_sel = [], None
+                self.measures_changed.emit()
         self._rebuild_cloud()
         if not append:
             self.cam.frame((0, 0, 0), 0.5 * float(np.linalg.norm(ext)))
@@ -623,6 +1156,7 @@ class Viewer(QOpenGLWidget):
         if not vis:
             self.cloud_full = self.cloud_snap = self.cloud_disp = self.cloud_cols = None
             self.n_disp = 0
+            self.cloud_ext = None
             self.update()
             return
         local = np.concatenate(vis)
@@ -635,6 +1169,7 @@ class Viewer(QOpenGLWidget):
         self.cloud_cols = height_colors(self.cloud_disp[:, 2])
         self.n_disp = len(self.cloud_disp)
         self.grid_z = float(local[:, 2].min())
+        self.cloud_ext = np.ptp(local, axis=0).astype(float)
         self.update()
 
     def frame_all(self):
@@ -809,12 +1344,15 @@ class Viewer(QOpenGLWidget):
     # ------------------------------------------------------------------ files
     def save(self, path):
         self.sync_bodies()
-        save_model(path, self.mesh, self.origin, extra={"bodies": self.reg.to_dict()})
+        save_model(path, self.mesh, self.origin, extra={
+            "bodies": self.reg.to_dict(), "measurements": self.measures_to_json(),
+            "measure_format": dict(units=self.meas_units, scale=self.meas_scale, dec=self.meas_dec)})
 
     def open_model(self, path):
         m, org = load_model(path)
         with open(path) as fh:
-            reg_data = json.load(fh).get("bodies")
+            data = json.load(fh)
+        reg_data = data.get("bodies")
         self.push_undo()
         if not self.clouds:
             self.origin = org
@@ -825,10 +1363,14 @@ class Viewer(QOpenGLWidget):
         self.mesh = m
         self.reg = Registry.from_dict(reg_data)
         self.reg.shift(shift)
+        self.measures_from_json(data.get("measurements"), shift)
+        fmt = data.get("measure_format") or {}
+        self.meas_units, self.meas_scale, self.meas_dec = fmt.get("units", ""), float(fmt.get("scale", 1.0)), int(fmt.get("dec", 3))
         self.sel, self.editing, self.pending = set(), None, []
         self.pristine = False
         self.sync_bodies()
         self.changed(); self.selection_changed.emit(); self.bodies_changed.emit()
+        self.measures_changed.emit(); self.state_changed.emit()
 
     def export_obj(self, path, original_coords):
         self.mesh.export_obj(path, self.origin if original_coords else np.zeros(3))
@@ -874,7 +1416,7 @@ class Viewer(QOpenGLWidget):
                 return
             dr["moved"] = True
         if not dr["pushed"]:
-            self.undo.append((self.mesh.copy(), self.mode, set(self.sel)))
+            self.undo.append(self.snapshot())
             self.redo.clear()
             self.pristine = False
             self.sel_trail = []
@@ -933,7 +1475,13 @@ class Viewer(QOpenGLWidget):
         elif b == Qt.MouseButton.RightButton:
             self.nav = "pan"
         elif b == Qt.MouseButton.LeftButton:
-            if self.tool == "select":
+            if self.tool == "measure":
+                self.measure_click(x, y, bool(m & Qt.KeyboardModifier.ControlModifier))
+            elif self.tool == "mesh":
+                self.lasso, self.lasso_on, self.lasso_add = [(x, y)], True, shift
+                self.lasso_w = [self._lasso_world(x, y)]
+                self.update()
+            elif self.tool == "select":
                 self.apply_pick(self.pick_element(x, y), shift)
             elif self.tool == "move":
                 h = self.pick_gizmo(x, y)
@@ -981,6 +1529,12 @@ class Viewer(QOpenGLWidget):
             self.cam.orbit(dx, dy); self.update()
         elif self.nav == "pan":
             self.cam.pan(dx, dy); self.update()
+        elif self.lasso_on:
+            lx, ly = self.lasso[-1]
+            if np.hypot(x - lx, y - ly) >= 3:
+                self.lasso.append((x, y))
+                self.lasso_w.append(self._lasso_world(x, y))
+                self.update()
         elif self.drag is not None:
             self.apply_drag(x, y, bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier))
         else:
@@ -991,11 +1545,16 @@ class Viewer(QOpenGLWidget):
             elif self.tool == "move":
                 h = self.pick_gizmo(x, y)
                 self.hover_axis = h[0] if h else None
+            elif self.tool == "measure":
+                self.measure_hover(x, y, bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier))
             if self.tool != "select":
                 self.update()
 
     def mouseReleaseEvent(self, e):
         self.nav = None
+        if self.lasso_on and e.button() == Qt.MouseButton.LeftButton:
+            self.finish_lasso()
+            return
         if self.drag is not None:
             self.drag = None
             self.axis_lock = None
@@ -1022,14 +1581,21 @@ class Viewer(QOpenGLWidget):
             self.finish_points_face()
         elif k in (K.Key_Return, K.Key_Enter) and self.tool == "solid":
             self.finish_solid()
+        elif k in (K.Key_Return, K.Key_Enter) and self.tool == "mesh":
+            self.commit_mp()
+        elif k in (K.Key_Return, K.Key_Enter) and self.tool == "measure":
+            self.finish_measure()
         elif k == K.Key_Backspace and self.pending:
-            self.pending.pop(); self.update_hud(); self.update()
+            self.undo_pick()
         elif k == K.Key_Escape:
-            if self.drag is not None:
+            if self.tool == "mesh" and (self.lasso_on or self.mp_pts is not None):
+                self.mp_clear()
+                self.update_hud(); self.update(); self.state_changed.emit()
+            elif self.drag is not None:
                 self.cancel_drag()
             elif self.pending or self.editing is not None:
                 self.pending, self.editing = [], None
-                self.update_hud(); self.update()
+                self.update_hud(); self.update(); self.state_changed.emit()
             else:
                 self.apply_pick(None, False)
         else:
@@ -1185,10 +1751,12 @@ class Viewer(QOpenGLWidget):
         if self.pending:
             pos = np.array([p[2] for p in self.pending], np.float32)
             glColor3f(1, 0.9, 0.2); glLineWidth(2.0 * dpr)
-            if self.tool == "points":
+            if self.tool == "points" or (self.tool == "measure" and self.meas_kind in ("distance", "path", "angle")):
                 glBegin(GL_LINE_STRIP)
                 for q in pos:
                     glVertex3f(*q)
+                if self.tool == "measure" and self.snap is not None:      # rubber band to the cursor
+                    glVertex3f(*self.snap[2])
                 glEnd()
             self._pts(pos, 12, (1.0, 0.9, 0.2))
         if self.solid_preview is not None:   # wireframe of the best-fit solid
@@ -1201,7 +1769,25 @@ class Viewer(QOpenGLWidget):
             glDrawArrays(GL_LINES, 0, len(pos))
             glDisableClientState(GL_VERTEX_ARRAY)
         if self.snap is not None:
-            self._pts(np.array([self.snap[2]], np.float32), 15, (0.3, 1.0, 0.4) if self.snap[0] == "mesh" else (1.0, 0.95, 0.2))
+            self._pts(np.array([self.snap[2]], np.float32), 15,
+                      {"mesh": (0.3, 1.0, 0.4), "edge": (0.3, 0.9, 1.0), "face": (0.3, 0.9, 1.0), "center": (1.0, 0.78, 0.2)}.get(self.snap[0], (1.0, 0.95, 0.2)))
+        self._draw_measures(dpr)
+        if self.tool == "mesh":
+            if self.mp_pts is not None:                    # the lassoed points
+                self._pts(np.ascontiguousarray(self.mp_pts[::max(1, len(self.mp_pts) // 200_000)], np.float32),
+                          3, (0.3, 1.0, 0.85))
+            if self.mp_lines is not None:                  # wireframe of the mesh that would be added
+                glColor3f(0.4, 1.0, 0.6); glLineWidth(1.0 * dpr)
+                glEnableClientState(GL_VERTEX_ARRAY)
+                glVertexPointer(3, GL_FLOAT, 0, self.mp_lines)
+                glDrawArrays(GL_LINES, 0, len(self.mp_lines))
+                glDisableClientState(GL_VERTEX_ARRAY)
+        if len(self.lasso_w) > 1:                          # the lasso being drawn
+            glColor3f(1.0, 0.9, 0.2); glLineWidth(2.0 * dpr)
+            glBegin(GL_LINE_LOOP)
+            for q in self.lasso_w:
+                glVertex3f(*q)
+            glEnd()
         glEnable(GL_DEPTH_TEST)
 
     def paintGL(self):
@@ -1226,6 +1812,7 @@ class Viewer(QOpenGLWidget):
                 self._arr = self._build_arrays()
             self._draw_faces(self._arr)
             self._draw_overlay(self._arr)
+            self.overlay.update()                          # labels follow the camera
         except Exception:
             traceback.print_exc()
             self._gl_failed = True
@@ -1233,7 +1820,8 @@ class Viewer(QOpenGLWidget):
 
 # ============================================================== main window ==
 SEG_SHAPES = ("cylinder", "cone", "sphere", "loft", "extrude")   # shapes whose smoothness "Segments" controls
-TOOL_NAMES = {"select": "Select", "move": "Move / Transform", "points": "Face from points", "solid": "Best-fit solid"}
+TOOL_NAMES = {"select": "Select", "move": "Move / Transform", "points": "Face from points", "solid": "Best-fit solid",
+              "mesh": "Mesh from points", "measure": "Measure"}
 # edit buttons: (label, Viewer method, modes in which the button is shown)
 EDIT_OPS = (("Subdivide", "op_subdivide", "f", "Subdivide faces (S)"), ("Extrude", "op_extrude", "ef", "Extrude (E)"),
             ("Fill face", "op_fill", "v", "Fill a face from the selected vertices (F)"),
@@ -1315,6 +1903,7 @@ class MainWindow(QMainWindow):
         self.v.selection_changed.connect(self.update_panel)
         self.v.state_changed.connect(self.sync_checked)
         self.v.state_changed.connect(self.sync_solid_controls)
+        self.v.measures_changed.connect(self.refresh_meas_list)
         self.refresh_coords()
         self.update_panel()
         self.statusBar().showMessage("File > Open point clouds (Ctrl+O) to begin, or drop files onto the window")
@@ -1350,12 +1939,13 @@ class MainWindow(QMainWindow):
 
         self.undo_act = self.act("Undo", "Ctrl+Z", self.v.do_undo, ed)
         self.redo_act = self.act("Redo", "Ctrl+Y", self.v.do_redo, ed)
+        self.redo_act.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
         ed.addSeparator()
         self.act("Delete selection", "Delete", self.v.op_delete, ed)
 
         tg = QActionGroup(self)
         self.tool_acts = {}
-        for key, sc in (("select", "Q"), ("move", "W"), ("points", "P"), ("solid", "B")):
+        for key, sc in (("select", "Q"), ("move", "W"), ("points", "P"), ("solid", "B"), ("mesh", "G"), ("measure", "R")):
             self.tool_acts[key] = self.act(TOOL_NAMES[key], sc, lambda k=key: self.v.set_tool(k), t, checkable=True, group=tg)
         self.tool_acts["move"].setChecked(True)
         t.addSeparator()
@@ -1370,6 +1960,7 @@ class MainWindow(QMainWindow):
 
         self.act("Plane", "Shift+A", self.v.op_add_plane, cr)
         self.act("Face from cloud points", None, lambda: self.v.set_tool("points"), cr)
+        self.act("Mesh from points (lasso, Poisson)", None, lambda: self.v.set_tool("mesh"), cr)
         sm = cr.addMenu("Best-fit solid")
         for key in SHAPES:
             self.act(SHAPE_NAMES[key], None, lambda k=key: self.pick_solid(k), sm)
@@ -1414,7 +2005,7 @@ class MainWindow(QMainWindow):
         tb = self.addToolBar("Tools")
         tb.setMovable(False)
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        for key in ("select", "move", "points", "solid"):
+        for key in ("select", "move", "points", "solid", "mesh", "measure"):
             a = self.tool_acts[key]
             a.setToolTip("%s (%s)" % (TOOL_NAMES[key], a.shortcut().toString()))
             tb.addAction(a)
@@ -1460,6 +2051,21 @@ class MainWindow(QMainWindow):
         self.sec_sel.setVisible(edit)
         self.sec_points.setVisible(v.tool == "points")
         self.sec_solid.setVisible(v.tool == "solid")
+        self.sec_mesh.setVisible(v.tool == "mesh")
+        self.sec_meas.setVisible(v.tool == "measure")
+        if v.tool == "measure":
+            i = self.meas_kc.findData(v.meas_kind)
+            if i >= 0 and self.meas_kc.currentIndex() != i:
+                self.meas_kc.blockSignals(True); self.meas_kc.setCurrentIndex(i); self.meas_kc.blockSignals(False)
+            self.meas_help.setText(MEAS_HELP[v.meas_kind])
+            self.meas_info.setText(v.meas_info_text())
+            self.meas_finish_btn.setVisible(v.meas_kind not in ("edge",) and v.meas_kind not in MEAS_AUTO)
+            self.meas_finish_btn.setEnabled(len(v.pending) >= MEAS_MIN.get(v.meas_kind, 99))
+        if v.tool == "mesh":
+            n = 0 if v.mp_pts is None else len(v.mp_pts)
+            self.mp_lbl.setText("%s points selected" % format(n, ",") if n else "Nothing selected - drag a loop around cloud points")
+            self.mp_info_lbl.setText(v.mp_info)
+            self.mp_add_btn.setEnabled(v.mp_preview is not None)
         if edit:
             for k, b in self.mode_btns.items():
                 b.blockSignals(True); b.setChecked(v.mode == k); b.blockSignals(False)
@@ -1612,6 +2218,108 @@ class MainWindow(QMainWindow):
         gl.addWidget(_small("Click points on the object's surface, then press Enter."))
         lay.addWidget(self.sec_solid)
 
+        # ---- mesh from points (Poisson reconstruction)
+        self.sec_mesh, gl = self._group("Mesh from points")
+        self.mp_lbl = QLabel("")
+        self.mp_lbl.setWordWrap(True)
+        gl.addWidget(self.mp_lbl)
+        dl = QSlider(Qt.Orientation.Horizontal); dl.setRange(5, 11); dl.setValue(self.v.mp_detail)
+        dl.setToolTip("Less detail = fewer, larger triangles and a smoother surface. More detail = finer surface, more triangles.")
+        dtxt = QLabel()
+        def detail_changed(x):
+            self.v.mp_detail = x
+            dtxt.setText({5: "very low", 6: "low", 7: "medium-low", 8: "medium", 9: "medium-high", 10: "high", 11: "very high"}[x])
+            self.v.schedule_mp()
+        dl.valueChanged.connect(detail_changed)
+        detail_changed(self.v.mp_detail)
+        gl.addLayout(_row("Detail", dtxt))
+        gl.addWidget(dl)
+        mt = QSpinBox(); mt.setRange(0, 1_000_000); mt.setSingleStep(5000); mt.setValue(self.v.mp_max_tris)
+        mt.setSpecialValueText("no limit"); mt.setKeyboardTracking(False)
+        mt.setToolTip("Upper limit on triangles - the mesh is simplified down to it. Very large meshes make the viewport slow.")
+        mt.valueChanged.connect(lambda x: (setattr(self.v, "mp_max_tris", x), self.v.schedule_mp()))
+        gl.addLayout(_row("Max triangles", mt))
+        oc = QComboBox()
+        for label, key in (("Auto", "auto"), ("Outward", "outward"), ("Inward", "inward")):
+            oc.addItem(label, key)
+        oc.setToolTip("Which way the surface faces. Auto: outward for an object that wraps around, "
+                      "toward the view for a one-sided scan (terrain, wall).")
+        oc.activated.connect(lambda i: (setattr(self.v, "mp_orient", oc.itemData(i)), self.v.schedule_mp()))
+        gl.addLayout(_row("Normals", oc))
+        tc = QCheckBox("Trim stray surface"); tc.setChecked(self.v.mp_trim)
+        tc.setToolTip("Cut away the skin that Poisson reconstruction invents where there are no points")
+        tc.toggled.connect(lambda x: (setattr(self.v, "mp_trim", x), self.v.schedule_mp()))
+        gl.addWidget(tc)
+        self.mp_info_lbl = _small("")
+        gl.addWidget(self.mp_info_lbl)
+        self.mp_add_btn = QPushButton("Add mesh to model (Enter)")
+        self.mp_add_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mp_add_btn.clicked.connect(lambda: self.v.commit_mp())
+        gl.addWidget(self.mp_add_btn)
+        cb = QPushButton("Clear selection (Esc)"); cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        cb.clicked.connect(lambda: (self.v.mp_clear(), self.v.update_hud(), self.v.update(), self.update_panel()))
+        gl.addWidget(cb)
+        gl.addWidget(_small("Drag a loop around cloud points; Shift+drag adds more. The green wireframe is the mesh that will be added."))
+        lay.addWidget(self.sec_mesh)
+
+        # ---- measure
+        self.sec_meas, gl = self._group("Measure")
+        kc = QComboBox()
+        for key in MEAS_MODES:
+            kc.addItem(MEAS_LABELS[key], key)
+        kc.activated.connect(lambda i: self.v.set_meas_kind(kc.itemData(i)))
+        self.meas_kc = kc
+        gl.addWidget(kc)
+        self.meas_help = _small("")
+        gl.addWidget(self.meas_help)
+        self.meas_finish_btn = QPushButton("Finish measurement (Enter)")
+        self.meas_finish_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.meas_finish_btn.clicked.connect(lambda: self.v.finish_measure())
+        gl.addWidget(self.meas_finish_btn)
+        gl.addWidget(_small("Selected shape"))
+        self.meas_info = _small("")
+        self.meas_info.setStyleSheet("color:#cfd8e3;")
+        gl.addWidget(self.meas_info)
+        fb = QPushButton("Diameter of selected shape")
+        fb.setToolTip("Fits the best sphere or cylinder to the selected shape and measures its diameter, radius and length")
+        fb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        fb.clicked.connect(lambda: self.v.fit_selection_diameter())
+        gl.addWidget(fb)
+        gl.addWidget(_small("Results"))
+        self.meas_list = QListWidget()
+        self.meas_list.setMinimumHeight(110)
+        self.meas_list.setToolTip("Click a measurement to highlight it in the view")
+        self.meas_list.currentRowChanged.connect(lambda r: self.v.set_meas_sel(r))
+        gl.addWidget(self.meas_list)
+        row = QHBoxLayout(); row.setSpacing(3)
+        for text, fn in (("Delete", lambda: self.v.delete_measure()), ("Clear all", lambda: self.v.clear_measures()),
+                         ("Copy", lambda: (QApplication.clipboard().setText(self.v.measures_text()), self.v.msg("Measurements copied")))):
+            b = QPushButton(text); b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            row.addWidget(b)
+        gl.addLayout(row)
+        sc_cb = QCheckBox("Show measurements"); sc_cb.setChecked(self.v.meas_show)
+        sc_cb.toggled.connect(lambda x: self.v.set_meas_format(show=x))
+        dt_cb = QCheckBox("All values on the labels"); dt_cb.setChecked(self.v.meas_details)
+        dt_cb.toggled.connect(lambda x: self.v.set_meas_format(details=x))
+        gl.addWidget(sc_cb); gl.addWidget(dt_cb)
+        uc = QComboBox()
+        for u in ("", "mm", "cm", "m", "km", "in", "ft"):
+            uc.addItem(u or "(none)", u)
+        uc.setToolTip("Name of the unit shown after the numbers")
+        uc.activated.connect(lambda i: self.v.set_meas_format(units=uc.itemData(i)))
+        gl.addLayout(_row("Unit", uc))
+        ss = QDoubleSpinBox(); ss.setRange(1e-9, 1e9); ss.setDecimals(6); ss.setValue(self.v.meas_scale)
+        ss.setKeyboardTracking(False)
+        ss.setToolTip("Displayed value = cloud units x this. Cloud in metres and you want mm: 1000")
+        ss.valueChanged.connect(lambda x: self.v.set_meas_format(scale=x))
+        gl.addLayout(_row("Scale", ss))
+        ds = QSpinBox(); ds.setRange(0, 8); ds.setValue(self.v.meas_dec)
+        ds.valueChanged.connect(lambda x: self.v.set_meas_format(dec=x))
+        gl.addLayout(_row("Decimals", ds))
+        self.meas_unit_cb, self.meas_scale_sp, self.meas_dec_sp, self.meas_show_cb = uc, ss, ds, sc_cb
+        lay.addWidget(self.sec_meas)
+
         # ---- display (rarely changed -> folded away)
         disp = Section("Display", collapsed=True)
         ps = QDoubleSpinBox(); ps.setRange(1, 20); ps.setValue(self.v.point_size)
@@ -1638,6 +2346,21 @@ class MainWindow(QMainWindow):
         sa.setMinimumWidth(190)
         self.props_dock.setWidget(sa)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.props_dock)
+
+    def refresh_meas_list(self):
+        v = self.v
+        self.meas_list.blockSignals(True)
+        self.meas_list.clear()
+        for i in range(len(v.measures)):
+            self.meas_list.addItem(v.measure_summary(i))
+        if v.meas_sel is not None and 0 <= v.meas_sel < len(v.measures):
+            self.meas_list.setCurrentRow(v.meas_sel)
+        self.meas_list.blockSignals(False)
+        for w, fn in ((self.meas_unit_cb, lambda: self.meas_unit_cb.setCurrentIndex(max(0, self.meas_unit_cb.findData(v.meas_units)))),
+                      (self.meas_scale_sp, lambda: self.meas_scale_sp.setValue(v.meas_scale)),
+                      (self.meas_dec_sp, lambda: self.meas_dec_sp.setValue(v.meas_dec)),
+                      (self.meas_show_cb, lambda: self.meas_show_cb.setChecked(v.meas_show))):
+            w.blockSignals(True); fn(); w.blockSignals(False)
 
     # -- coordinate panel
     def _off(self):

@@ -3,3 +3,4 @@ PyOpenGL
 numpy
 scipy
 manifold3d
+open3d

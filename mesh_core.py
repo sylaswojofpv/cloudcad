@@ -201,14 +201,25 @@ class Mesh:
             if not self.F:
                 self._tri = (np.zeros((0, 3, 3)), np.zeros(0, int), np.zeros((0, 3)))
             else:
-                tris, tf, fn = [], [], []
-                for fi, f in enumerate(self.F):
+                tris, tf = [], []
+                fn = np.zeros((len(self.F), 3))
+                lens = np.fromiter((len(f) for f in self.F), int, len(self.F))
+                t3 = np.flatnonzero(lens == 3)
+                if len(t3):                                    # triangles (e.g. reconstructed meshes): vectorised
+                    A = self.V[np.array([self.F[i] for i in t3])]
+                    nr = np.cross(A[:, 1] - A[:, 0], A[:, 2] - A[:, 0])
+                    l = np.linalg.norm(nr, axis=1)
+                    fn[t3] = np.where((l > 1e-12)[:, None], nr / np.maximum(l, 1e-12)[:, None], [0.0, 0.0, 1.0])
+                    tris.append(A)
+                    tf.append(t3)
+                for fi in np.flatnonzero(lens != 3):
+                    f = self.F[fi]
                     P = self.V[f]
                     c = P.mean(0)
                     tris.append(np.stack([np.broadcast_to(c, P.shape), P, np.roll(P, -1, 0)], 1))
-                    tf.extend([fi] * len(f))
-                    fn.append(self.face_normal(fi))
-                self._tri = (np.concatenate(tris), np.array(tf, int), np.array(fn))
+                    tf.append(np.full(len(f), fi, int))
+                    fn[fi] = self.face_normal(fi)
+                self._tri = (np.concatenate(tris), np.concatenate(tf).astype(int), fn)
         return self._tri
 
     # ---- freeform-style operations
