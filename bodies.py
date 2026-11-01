@@ -35,6 +35,7 @@ class Registry:
         self.bodies, self.folders = {}, {}
         self.next_id = 1
         self.counts = {}
+        self.merges = {}           # merged body id -> [{id, name, kind, src, V, F}] : the bodies it was merged from
 
     # ----------------------------------------------------------------- create
     def _name(self, prefix):
@@ -80,6 +81,11 @@ class Registry:
                 b.geom = (b.geom[0] + delta, b.geom[1])
             if b.src is not None:
                 b.src["pts"] = b.src["pts"] + delta
+        for parts in getattr(self, "merges", {}).values():
+            for q in parts:
+                q["V"] = q["V"] + delta
+                if q["src"] is not None:
+                    q["src"]["pts"] = q["src"]["pts"] + delta
 
     # --------------------------------------------------------------------- io
     def to_dict(self):
@@ -93,6 +99,9 @@ class Registry:
                        for b in self.bodies.values()],
             "folders": [{"id": f.id, "name": f.name, "op": f.op, "operands": f.operands, "result": f.result}
                         for f in self.folders.values()],
+            "merges": [{"id": k, "parts": [{"id": q["id"], "name": q["name"], "kind": q["kind"], "src": src(q["src"]),
+                                            "V": np.asarray(q["V"]).tolist(), "F": q["F"]} for q in v]}
+                       for k, v in getattr(self, "merges", {}).items()],
         }
 
     @classmethod
@@ -111,6 +120,11 @@ class Registry:
             r.bodies[b.id] = b
         for e in d.get("folders", []):
             r.folders[e["id"]] = Folder(e["id"], e["name"], e["op"], e["operands"], e["result"])
+        for e in d.get("merges", []):
+            r.merges[e["id"]] = [{"id": q["id"], "name": q["name"], "kind": q.get("kind", "mesh"),
+                                  "src": (dict(q["src"], pts=np.array(q["src"]["pts"], float)) if q.get("src") else None),
+                                  "V": np.array(q["V"], float).reshape(-1, 3), "F": [list(f) for f in q["F"]]}
+                                 for q in e["parts"]]
         return r
 
 

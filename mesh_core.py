@@ -349,11 +349,37 @@ class Mesh:
         self._tri = None
         return ne, nf
 
-    def delete_faces(self, face_ids):
-        S = set(face_ids)
-        self.T = [t for i, t in enumerate(self.T) if i not in S]
-        self.F = [f for i, f in enumerate(self.F) if i not in S]
+    def drop_faces(self, face_ids):
+        """Remove faces, plus the vertices that only they used (nothing is left floating).
+        Returns (vertex map, face map): old index -> new index for everything that was kept."""
+        rm = set(face_ids)
+        keep_f = [i for i in range(len(self.F)) if i not in rm]
+        used = {u for i in keep_f for u in self.F[i]}
+        gone = {u for i in rm if i < len(self.F) for u in self.F[i]} - used
+        keep_v = [i for i in range(len(self.V)) if i not in gone]
+        vmap = {o: n for n, o in enumerate(keep_v)}
+        fmap = {o: n for n, o in enumerate(keep_f)}
+        self.F = [[vmap[u] for u in self.F[i]] for i in keep_f]
+        self.T = [self.T[i] for i in keep_f]
+        self.V = self.V[keep_v]
         self._tri = None
+        return vmap, fmap
+
+    def delete_faces(self, face_ids):
+        return self.drop_faces(face_ids)
+
+    def remove_unused_vertices(self):
+        """Delete vertices that no face uses. Returns how many were removed."""
+        used = np.zeros(len(self.V), bool)
+        for f in self.F:
+            used[f] = True
+        n = int((~used).sum())
+        if n:
+            mp = np.cumsum(used) - 1
+            self.F = [[int(mp[u]) for u in f] for f in self.F]
+            self.V = self.V[used]
+            self._tri = None
+        return n
 
     def remove_vertices(self, drop):
         """Remove vertices and every face using them. Returns old->new index map."""
@@ -600,8 +626,24 @@ class Camera:
         self.width, self.height = 800, 600
         self.radius = 10.0  # scene radius, only used for the far plane
 
-    near = property(lambda s: max(s.dist * 0.02, 1e-6))
-    far = property(lambda s: s.dist + 10.0 * s.radius)
+    scene = None   # (centre, radius) of everything drawn: the clip planes hug it, so nothing is cut off and depth stays precise
+
+    @property
+    def near(self):
+        base = max(self.dist * 0.02, 1e-6)
+        if self.scene is None:
+            return base
+        c, R = self.scene
+        d = float(np.linalg.norm(self.eye() - c))
+        return max(base, min(d - 1.1 * R, 0.5 * self.dist))
+
+    @property
+    def far(self):
+        if self.scene is None:
+            return self.dist + 10.0 * self.radius
+        c, R = self.scene
+        d = float(np.linalg.norm(self.eye() - c))
+        return max(d + 1.1 * R, self.dist + 1.5 * self.radius)
 
     def _dir(self):  # target -> eye
         cp = np.cos(self.pitch)

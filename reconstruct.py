@@ -157,3 +157,82 @@ def poisson_mesh(P, detail=8, max_tris=50_000, trim=True, eye=None, orient="auto
     if n_in > len(P):
         info += "; %s of %s points used" % (format(len(P), ","), format(n_in, ","))
     return V, F.tolist(), info
+
+
+def delaunay_mesh(P, mode="best", max_edge=0.0, max_tris=50_000, eye=None):
+    """Build a 2.5D triangle mesh using Delaunay triangulation.
+
+    mode='best' projects points onto their best-fit plane before triangulating;
+    mode='xy' triangulates in world XY (useful for terrain-like point clouds).
+    Returns (V, F, info), compatible with poisson_mesh().
+    """
+    from scipy.spatial import Delaunay, QhullError
+
+    P = np.asarray(P, dtype=float)
+    P = P[np.isfinite(P).all(axis=1)]
+    if len(P) < 3:
+        raise ValueError("Select at least 3 non-collinear points to build a Delaunay mesh")
+
+    # Remove duplicate points; Delaunay requires unique 2D coordinates.
+    if mode == "xy":
+        basis_points = P[:, :2]
+    elif mode == "best":
+        center = P.mean(axis=0)
+        _, singular, vt = np.linalg.svd(P - center, full_matrices=False)
+        if len(singular) < 2 or singular[1] < 1e-10:
+            raise ValueError("The selected points are collinear; a surface cannot be triangulated")
+        basis_points = (P - center) @ vt[:2].T
+    else:
+        raise ValueError("Unknown Delaunay mode: %s" % mode)
+
+    # Round only for duplicate detection; preserve original 3D coordinates in the output.
+    _, unique_idx = np.unique(np.round(basis_points, decimals=10), axis=0, return_index=True)
+    unique_idx = np.sort(unique_idx)
+    P = P[unique_idx]
+    basis_points = basis_points[unique_idx]
+    if len(P) < 3:
+        raise ValueError("Need at least 3 unique points to build a Delaunay mesh")
+
+    try:
+        tri = Delaunay(basis_points)
+    except QhullError as ex:
+        raise ValueError("Could not triangulate these points; select a wider, less-collinear region") from ex
+
+    F = np.asarray(tri.simplices, dtype=int)
+    if max_edge and max_edge > 0:
+        tri_pts = P[F]
+        lengths = np.stack([
+            np.linalg.norm(tri_pts[:, 1] - tri_pts[:, 0], axis=1),
+            np.linalg.norm(tri_pts[:, 2] - tri_pts[:, 1], axis=1),
+            np.linalg.norm(tri_pts[:, 0] - tri_pts[:, 2], axis=1),
+        ], axis=1)
+        F = F[lengths.max(axis=1) <= float(max_edge)]
+
+    if len(F) == 0:
+        raise ValueError("No triangles remain; increase the maximum edge length or select a denser region")
+
+    n_before = len(F)
+    if max_tris and len(F) > int(max_tris):
+        if int(max_tris) < 1:
+            raise ValueError("Maximum triangle count must be zero (unlimited) or at least 1")
+        # Keep a spread across the triangulation instead of just one local patch.
+        keep = np.linspace(0, len(F) - 1, int(max_tris), dtype=int)
+        F = F[keep]
+
+    # Consistent winding, oriented toward the eye when available.
+    normals = np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]])
+    if eye is not None:
+        target = np.asarray(eye, float) - P[F].mean(axis=1)
+        flip = np.einsum("ij,ij->i", normals, target) < 0
+    elif mode == "xy":
+        flip = normals[:, 2] < 0
+    else:
+        # Use the best-fit plane's normal as the consistent orientation.
+        flip = normals @ vt[2] < 0 if len(vt) >= 3 else np.zeros(len(F), dtype=bool)
+    F[flip] = F[flip][:, [0, 2, 1]]
+
+    info = "%s points -> %s Delaunay triangles (%s plane)" % (
+        format(len(P), ","), format(len(F), ","), "XY" if mode == "xy" else "best-fit")
+    if n_before > len(F):
+        info += "; filtered/limited from %s triangles" % format(n_before, ",")
+    return P, F.tolist(), info

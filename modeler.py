@@ -26,16 +26,34 @@ from mesh_core import (Mesh, Camera, load_xyz, save_model, load_model, order_pol
                        ray_plane, ray_axis_param, pick_cloud_point, pick_mesh_vertex,
                        pick_mesh_edge, pick_mesh_face, SurfaceIndex, frame_from_axes, pca_frame)
 from solids import SHAPES, SHAPE_NAMES, MIN_POINTS, SWEEP_SHAPES, fit_solid
-from booleans import shells_of, boolean_op, replace_faces, split_loose
-from bodies import Registry, OP_NAMES, extract_faces, geom_sig
+from booleans import shells_of, boolean_op, replace_faces, split_loose, signed_volume
+from bodies import Body, Registry, OP_NAMES, extract_faces, geom_sig
 from bodies_panel import BodiesPanel
-from reconstruct import poisson_mesh, points_in_polygon
+from reconstruct import poisson_mesh, delaunay_mesh, points_in_polygon
+import constraints as C
+import mirror as MI
+import stitch as ST
 from measure import build as meas_build, from_clicks, fit_round, selection_info, ray_segment_closest, TITLES as MEAS_TITLES
 
 MAX_DISPLAY = 3_000_000   # points actually drawn (stride-decimated above this)
 MAX_SNAP = 400_000        # points tested during hover / drag snapping
 TOOLS = {"select": "Select", "move": "Move / Transform", "points": "Face from cloud points",
-         "solid": "Solid (best fit)", "mesh": "Mesh from points (Poisson)", "measure": "Measure"}
+         "solid": "Solid (best fit)", "mesh": "Mesh from points (Poisson)", "measure": "Measure",
+         "constrain": "Constraints", "mirror": "Mirror body"}
+MIR_PRESETS = (("+X side", (1, 0, 0)), ("-X side", (-1, 0, 0)), ("+Y side", (0, 1, 0)), ("-Y side", (0, -1, 0)),
+               ("+Z side", (0, 0, 1)), ("-Z side", (0, 0, -1)))
+CON_AUTO = dict(distance=2, angle=2, equal=2, midpoint=2, align=1)     # picks that apply the constraint by themselves
+CON_SYMBOL = dict(parallel="∥", perpendicular="⊥", collinear="≡", equal="=", midpoint="M", fixed="Fix")
+CON_HELP = dict(
+    parallel="Pick the object that stays put first (edge or face), then the ones to turn parallel to it. Enter = apply.",
+    perpendicular="Pick the object that stays put first (edge or face), then the ones to turn perpendicular to it. Enter = apply.",
+    collinear="Pick the stationary vertex / edge / face first, then the ones that move onto it: edges end up on the same line, faces on the same plane, a vertex on the line / plane. Enter = apply.",
+    distance="Pick two vertices / edges / faces (first stays, second moves to the distance), or ONE edge to set its length.",
+    angle="Pick two edges / faces (first stays, second turns to the angle). Edge + face = angle between the edge and the face.",
+    equal="Pick an edge, then the edge to resize to the same length.",
+    midpoint="Pick an edge, then the vertex to move to its middle.",
+    align="Pick an edge or face to lay along the chosen world axis (edge along the axis, face facing it).",
+    fixed="Pick vertices / edges / faces to lock in place. Enter = apply.")
 MEAS_MODES = ("distance", "path", "angle", "circle", "sphere", "edge", "faceangle")
 MEAS_LABELS = {"distance": "Distance (2 points)", "path": "Path length (many points)", "angle": "Angle (3 points)",
                "circle": "Diameter / radius (circle)", "sphere": "Diameter (sphere)", "edge": "Edge length",
@@ -58,11 +76,14 @@ HINTS = {
     "move": "Drag a handle or element. X/Y/Z lock axis, Ctrl = snap to cloud, Esc cancels",
     "points": "Click cloud points (Ctrl = ignore mesh verts). Enter = make face, Backspace = undo point, Esc = cancel",
     "solid": "Click points on the object's surface - more points = better fit. Enter = create, Backspace = undo point, Esc = cancel",
-    "mesh": "Drag a loop (lasso) around cloud points to build a mesh (Shift = add to selection). Change detail in the panel. Enter = add to model, Esc = clear",
+    "mirror": "Select bodies (or Ctrl+click them, again to remove), then drag to slide the mirror plane (Shift+drag = tilt it). Match the ghost to the cloud, optionally Auto-align, then Enter = create",
+    "constrain": "Click vertices, edges and faces in order - the FIRST one stays, the next ones move. Enter = apply, Backspace = undo pick",
+    "mesh": "Click the corners of a polygon around cloud points, right-click to close it (Shift = add, Ctrl = remove). Pick the method in the panel. Enter = add mesh to model, Esc = clear",
 }
 SOLID_HINTS = {
     "plane": "Click points on the flat surface (3+). Enter = create, Backspace = undo point, Esc = cancel",
     "extrude": "Click many points all around the shape's sides (not just one face). The 2D profile and direction are fitted to all of them. Enter = create, Backspace = undo, Esc = cancel",
+    "revolve": "Click many points on the surface of a round shape (vase, bottle, bowl, dome...) - all along its length, front side is enough. The axis and the profile curve are fitted to all of them and spun around the axis. Enter = create, Backspace = undo, Esc = cancel",
     "loft": "Click many points over the surface, all around and along its length. Sections are fitted to all of them. Enter = create, Backspace = undo, Esc = cancel",
 }
 
@@ -93,11 +114,51 @@ class MeasureOverlay(QWidget):
                 for i, m in enumerate(v.measures):
                     hot = i == v.meas_sel
                     self._label(p, m["res"]["anchor"], v.meas_label_lines(m["res"], hot or v.meas_details), hot, False)
+            if v.con_show:
+                for i, c in enumerate(v.constraints):
+                    self._badge(p, i, c)
             live = v.meas_live()
             if live is not None:
                 self._label(p, live[0], live[1], True, True)
         finally:
             p.end()
+
+    def _badge(self, p, i, c):
+        v = self.v
+        st = v.con_status[i] if i < len(v.con_status) else "ok"
+        k = c["kind"]
+        txt = CON_SYMBOL.get(k, "")
+        if k == "distance":
+            txt = "↔ " + v.meas_fmt(c["value"], "len")
+        elif k == "angle":
+            txt = "∠ " + v.meas_fmt(c["value"], "deg")
+        elif k == "align":
+            txt = "→ " + "XYZ"[int(c["value"])]
+        ents = c["ents"]
+        spots = [v.con_anchor_pos(e) for e in ents] if k == "fixed" else [v.con_anchor_pos(ents[-1])]
+        hot = i == v.con_sel
+        if not c.get("on", True):
+            col = QColor(140, 140, 150)
+        elif st not in ("ok", None):
+            col = QColor(255, 70, 70)
+        else:
+            col = QColor(90, 215, 255)
+        cam = v.cam
+        for w in spots:
+            if w is None:
+                continue
+            sx, sy, _, ww = cam.project(np.asarray(w, float)[None, :])
+            if not np.isfinite(sx[0]) or not np.isfinite(sy[0]) or ww[0] <= cam.near:
+                continue
+            f = QFont(self.font()); f.setPointSize(9); f.setBold(True); p.setFont(f)
+            fm = p.fontMetrics()
+            wd, ht = fm.horizontalAdvance(txt) + 12, fm.height() + 6
+            x, y = float(sx[0]) - wd / 2, float(sy[0]) + 8
+            p.setBrush(QColor(20, 22, 26, 225))
+            p.setPen(QPen(QColor(255, 255, 255) if hot else col, 1.5))
+            p.drawRoundedRect(QRectF(x, y, wd, ht), 5, 5)
+            p.setPen(col)
+            p.drawText(QPointF(x + 6, y + 3 + fm.ascent()), txt)
 
     def _label(self, p, world, lines, hot, live):
         cam = self.v.cam
@@ -124,6 +185,8 @@ class Viewer(QOpenGLWidget):
     status = Signal(str)
     selection_changed = Signal()
     state_changed = Signal()
+    mirror_changed = Signal()       # the mirror plane / source body changed
+    constraints_changed = Signal()  # the list of constraints (or their state) changed
     measures_changed = Signal()    # the list of measurements (or how they are shown) changed
     bodies_changed = Signal()      # the Bodies list needs a refresh
 
@@ -142,6 +205,7 @@ class Viewer(QOpenGLWidget):
         self.mode, self.sel, self.tool = "v", set(), "move"
         # cloud
         self.cloud_full = self.cloud_snap = self.cloud_disp = None
+        self._cloud_bounds = None
         self.cloud_cols = None
         self.vbo = None
         self._cloud_dirty = False
@@ -162,11 +226,24 @@ class Viewer(QOpenGLWidget):
         self.meas_kind, self.meas_sel, self.meas_hover = "distance", None, None
         self.meas_show, self.meas_details = True, False
         self.meas_units, self.meas_scale, self.meas_dec = "", 1.0, 3
+        # constraints (see constraints.py)
+        self.constraints, self.con_status, self.con_sel, self.con_show = [], [], None, True
+        self.con_auto = False
+        # mirror body
+        self.mir_src, self.mir_base, self.mir_p = [], (np.zeros(3), np.array([1.0, 0, 0])), [0.0, 0.0, 0.0]
+        self._mir_nosync = False
+        self.mir_keep, self.mir_weld, self.mir_link, self.mir_info, self.mir_drag, self._mir_cache = True, False, True, "", None, None
+        self.mirrors, self._mir_busy = [], False      # live links: a mirrored body that follows its original
+        self.con_kind, self.con_custom, self.con_value, self.con_axis, self.con_rigid = "parallel", False, 1.0, 2, True
+        self._con_nv, self._con_nf, self._con_busy, self.con_hit = -1, -1, False, None
         self.cloud_ext = None                    # size of the visible cloud
         self._edge_key, self._edge_arr = None, None
         # mesh from points (Poisson)
         self.mp_pts, self.mp_preview, self.mp_lines, self.mp_info = None, None, None, ""
         self.mp_detail, self.mp_max_tris, self.mp_trim, self.mp_orient = 8, 50_000, True, "auto"
+        self.merge_tol, self.merge_bridge = 0.0, 0.0       # stitch tolerance (0 = automatic), bridge gaps up to (0 = off)
+        self.mp_method, self.mp_select, self.mp_max_edge = "poisson", "polygon", 0.0   # poisson | delaunay_best | delaunay_xy ; polygon | freehand
+        self.poly_active, self.poly_cursor, self.lasso_sub, self._rpress = False, None, False, None
         self.lasso, self.lasso_w, self.lasso_on, self.lasso_add = [], [], False, False
         self._mp_timer = QTimer(self)            # rebuild the preview shortly after a setting stops changing
         self._mp_timer.setSingleShot(True)
@@ -197,6 +274,10 @@ class Viewer(QOpenGLWidget):
 
     # ------------------------------------------------------------ state helpers
     def changed(self):
+        if self.constraints:
+            self.solve_constraints()
+        if self.mirrors:
+            self.update_mirrors()
         self.mesh.touch()
         self._arr = None
         self.update()
@@ -215,6 +296,10 @@ class Viewer(QOpenGLWidget):
             extra = "  [%s: %d pts%s]" % (SHAPE_NAMES[self.solid_shape], len(self.pending), self.solid_info)
         elif self.tool == "measure":
             extra = "  [%s: %d picked]" % (self.meas_kind, len(self.pending))
+        elif self.tool == "mirror":
+            extra = "  [%d bodies to mirror]" % self.mir_body_count()
+        elif self.tool == "constrain":
+            extra = "  [%s: %d picked]" % (C.LABEL[self.con_kind], len(self.pending))
         elif self.tool == "mesh":
             extra = "  [%s pts selected%s]" % (format(0 if self.mp_pts is None else len(self.mp_pts), ","),
                                               "" if self.mp_preview is None else ", %s triangles" % format(len(self.mp_preview[1]), ","))
@@ -227,6 +312,10 @@ class Viewer(QOpenGLWidget):
     def hint_text(self):
         if self.tool == "solid":
             return SOLID_HINTS.get(self.solid_shape, HINTS["solid"])
+        if self.tool == "mirror":
+            return HINTS["mirror"]
+        if self.tool == "constrain":
+            return CON_HELP[self.con_kind]
         if self.tool == "measure":
             return MEAS_HELP[self.meas_kind] + " Enter = finish, Backspace = undo point, Esc = cancel"
         return HINTS[self.tool]
@@ -235,7 +324,8 @@ class Viewer(QOpenGLWidget):
         self.status.emit(s)
 
     def snapshot(self):
-        return (self.mesh.copy(), self.mode, set(self.sel), copy.deepcopy(self.reg))
+        return (self.mesh.copy(), self.mode, set(self.sel), copy.deepcopy(self.reg), copy.deepcopy(self.constraints),
+                copy.deepcopy(self.mirrors))
 
     def push_undo(self):
         self.undo.append(self.snapshot())
@@ -247,11 +337,17 @@ class Viewer(QOpenGLWidget):
     def restore(self, snap):
         self.mesh, self.mode, self.sel = snap[0].copy(), snap[1], set(snap[2])
         self.reg = copy.deepcopy(snap[3])
+        self.constraints = copy.deepcopy(snap[4]) if len(snap) > 4 else []
+        self._con_nv, self._con_nf = len(self.mesh.V), len(self.mesh.F)
+        self.mirrors = copy.deepcopy(snap[5]) if len(snap) > 5 else []
+        self.con_status, self.con_sel = [], None
+        self._mir_cache = None
         self.sel_trail = []
         self.drag = None
         self.changed()
         self.selection_changed.emit()
         self.bodies_changed.emit()
+        self.constraints_changed.emit()
         self.update_hud()
 
     # The redo stack holds snapshots (mesh edits) and small dicts (a picked point / a clicked selection that was
@@ -439,6 +535,507 @@ class Viewer(QOpenGLWidget):
                 continue
 
     # --- snapping: cloud points, shape vertices, points on edges / faces
+    # ------------------------------------------------------------ mirror body
+    def mir_plane(self):
+        return MI.plane_from(self.mir_base[0], self.mir_base[1], self.mir_p)
+
+    def mir_valid(self):
+        n = len(self.mesh.F)
+        if self.mir_src and max(self.mir_src) >= n:
+            self.mir_src = []
+        return bool(self.mir_src)
+
+    def _mir_shells(self, faces):
+        """Whole bodies (connected solids) that contain any of the given faces."""
+        want, out = set(faces), []
+        for fl in shells_of(self.mesh):
+            if want.intersection(fl):
+                out += list(fl)
+        return sorted(out)
+
+    def mir_follow_selection(self):
+        """In the Mirror tool the bodies to mirror are simply the bodies that are selected."""
+        if self.tool != "mirror" or self._mir_nosync:
+            return
+        fs = self.sel_faces()
+        if not fs:
+            return
+        new = self._mir_shells(fs)
+        if new != sorted(self.mir_src):
+            self.mir_set_source(new, keep_plane=bool(self.mir_src), select=False)
+
+    def mir_set_source(self, faces, keep_plane=False, select=True):
+        self.mir_src = sorted(faces)
+        if select and self.mir_src:                        # the selection shows what will be mirrored
+            self.mode, self.sel, self.sel_trail = "f", set(self.mir_src), []
+            self._arr = None
+            self.selection_changed.emit()
+        self._mir_cache = None
+        self.mir_info = ""
+        if self.mir_src and not keep_plane:
+            self.mir_preset(0, emit=False)
+        self.update_hud(); self.update(); self.mirror_changed.emit(); self.state_changed.emit()
+
+    def mir_use_selection(self, quiet=False):
+        fs = self.sel_faces()
+        if not fs:
+            if not quiet:
+                self.msg("Select a body first (or Ctrl+click one)")
+            return
+        self.mir_set_source(self._mir_shells(fs))
+        self.msg("%d bod%s will be mirrored. Drag to slide the plane, Shift+drag to tilt it" % (self.mir_body_count(), "y" if self.mir_body_count() == 1 else "ies"))
+
+    def mir_src_points(self):
+        if not self.mir_valid():
+            return np.zeros((0, 3))
+        return self.mesh.V[sorted({v for i in self.mir_src for v in self.mesh.F[i]})]
+
+    def mir_preset(self, k, emit=True):
+        """Put the plane against one side of the body (normal pointing away from it)."""
+        P = self.mir_src_points()
+        if not len(P):
+            return
+        n = np.array(MIR_PRESETS[k][1], float)
+        c, n = MI.side_plane(P, n)
+        self.mir_base, self.mir_p, self.mir_info = (c, n), [0.0, 0.0, 0.0], ""
+        if emit:
+            self.update(); self.mirror_changed.emit()
+
+    def mir_set_params(self, d=None, a=None, b=None):
+        for i, v in enumerate((d, a, b)):
+            if v is not None:
+                self.mir_p[i] = float(v)
+        self.mir_info = ""
+        self.update(); self.mirror_changed.emit()
+
+    def mir_geometry(self):
+        """(triangles (T,3,3), edges (E,2)) of the source body, cached until the mesh changes."""
+        key = self.mesh.triangulate()
+        if self._mir_cache is None or self._mir_cache[0] is not key:
+            tri, tf, _ = key
+            src = np.zeros(len(self.mesh.F), bool)
+            src[self.mir_src] = True
+            ed = {(min(a, b), max(a, b)) for i in self.mir_src for f in [self.mesh.F[i]] for a, b in zip(f, f[1:] + f[:1])}
+            self._mir_cache = (key, tri[src[tf]], np.array(sorted(ed), int).reshape(-1, 2))
+        return self._mir_cache[1], self._mir_cache[2]
+
+    def mir_click_body(self, x, y, add):
+        fi = pick_mesh_face(self.cam, self.mesh, x, y)
+        if fi is None:
+            return self.msg("Ctrl+click a face of a body to add it (Ctrl+click again to remove it)")
+        shell = set(self._mir_shells([fi]))
+        cur = set(self.mir_src) if self.mir_valid() else set()
+        if shell <= cur:                                   # already in: click again to take it out
+            new = cur - shell
+        else:
+            new = cur | shell
+        self.mir_set_source(new, keep_plane=bool(cur))
+        self.msg("%d bodies will be mirrored (Ctrl+click adds / removes a body)" % self.mir_body_count())
+
+    def mir_body_count(self):
+        if not self.mir_valid():
+            return 0
+        return len({self.mesh.T[i] for i in self.mir_src})
+
+    def mir_clear(self):
+        self.mir_src, self._mir_cache = [], None
+        self.update_hud(); self.update(); self.mirror_changed.emit()
+
+    def mir_press(self, x, y, shift):
+        if not self.mir_valid():
+            return self.msg("Ctrl+click a body (or select one first) to mirror it")
+        c, n = self.mir_plane()
+        o, d = self.cam.ray(x, y)
+        self.mir_drag = dict(p0=list(self.mir_p), c=c, n=n, o0=o, r0=d, rot=shift, press=(x, y))
+
+    def mir_move(self, x, y):
+        dr = self.mir_drag
+        if dr is None:
+            return
+        if dr["rot"]:
+            dx, dy = x - dr["press"][0], y - dr["press"][1]
+            self.mir_p[1] = dr["p0"][1] + dy * 0.004
+            self.mir_p[2] = dr["p0"][2] + dx * 0.004
+        else:
+            o, r = self.cam.ray(x, y)
+            s1, s0 = ray_axis_param(o, r, dr["c"], dr["n"]), ray_axis_param(dr["o0"], dr["r0"], dr["c"], dr["n"])
+            if s1 is None or s0 is None:
+                return
+            self.mir_p[0] = dr["p0"][0] + (s1 - s0)
+        self.mir_info = ""
+        self.update(); self.mirror_changed.emit()
+
+    def mir_align(self):
+        """Fit the plane to the point cloud, starting from where the user put it."""
+        if not self.mir_valid():
+            return self.msg("Select a body to mirror first")
+        vis = [c["pts"] for c in self.clouds if c.get("visible", True)]
+        if not vis:
+            return self.msg("Load (and show) a point cloud first")
+        tri, _ = self.mir_geometry()
+        S = MI.sample_surface(tri, 2500)
+        c, n = self.mir_plane()
+        R = MI.reflect(S, c, n)
+        ext = float(np.linalg.norm(np.ptp(S, axis=0))) or 1.0
+        lo, hi = R.min(0) - 0.6 * ext, R.max(0) + 0.6 * ext
+        P = np.vstack([q[(q >= lo).all(1) & (q <= hi).all(1)].astype(np.float64) for q in vis])
+        try:
+            p, before, after = MI.fit_plane(S, P, self.mir_base[0], self.mir_base[1], self.mir_p)
+        except ValueError as ex:
+            return self.msg(str(ex))
+        self.mir_p = list(p)
+        c, n = self.mir_plane()
+        self.mir_base, self.mir_p = (c, n), [0.0, 0.0, 0.0]
+        f = lambda v: self.meas_fmt(v, "len")
+        self.mir_info = "Average gap to the cloud: %s -> %s" % (f(before), f(after))
+        self.msg("Mirror plane aligned. " + self.mir_info)
+        self.update(); self.mirror_changed.emit()
+
+    def mir_commit(self):
+        if not self.mir_valid():
+            return self.msg("Select a body to mirror first")
+        c, n = self.mir_plane()
+        m = self.mesh
+        fids = list(self.mir_src)
+        used = sorted({v for i in fids for v in m.F[i]})
+        self.push_undo()
+        if not self.mir_keep:                              # move the body itself to the other side
+            m.V[used] = MI.reflect(m.V[used], c, n)
+            m.flip_faces(fids)
+            self.sel, self.mode, self.sel_trail = set(fids), "f", []
+            self.mir_base, self.mir_p = (c, n), [0.0, 0.0, 0.0]
+            self._mir_cache = None
+            self.changed(); self.selection_changed.emit(); self.mirror_changed.emit()
+            return self.msg("Bodies mirrored")
+        self.sync_bodies()
+        new, made = [], []
+        for t in sorted({m.T[i] for i in fids}):           # every selected body gets its own mirrored body
+            bf = [i for i, tt in enumerate(m.T) if tt == t]
+            tag = self.reg.new_body("Mirror", "mesh").id
+            nw, sv, dv = self._mir_append(bf, c, n, self.mir_weld, tag)
+            new += nw
+            if self.mir_link:
+                made.append(dict(src=[t], dst=tag, c=np.asarray(c, float), n=np.asarray(n, float), weld=bool(self.mir_weld),
+                                 stamp=None, src_vs=sv, dst_vs=dv))
+        for L in made:
+            L["stamp"] = (len(m.V), len(m.F))
+        self.mirrors += made
+        self._mir_cache = None
+        self.sync_bodies()
+        self.mode, self.sel, self.sel_trail = "f", set(new), []
+        self._mir_nosync = True
+        try:
+            self.changed(); self.selection_changed.emit(); self.bodies_changed.emit()
+        finally:
+            self._mir_nosync = False
+        self.mir_info = ""
+        self.mirror_changed.emit(); self.state_changed.emit()
+        nb = len({m.T[i] for i in new})
+        self.msg("%d mirrored bod%s created%s. The originals are unchanged" % (
+            nb, "y" if nb == 1 else "ies", " and linked: edits to an original are mirrored onto its copy" if self.mir_link else ""))
+
+    def _mir_append(self, fids, c, n, weld, tag):
+        """Add a mirrored, normal-flipped copy of the faces. Returns (new face ids, source vertices, their mirror vertices)."""
+        m = self.mesh
+        used = sorted({v for i in fids for v in m.F[i]})
+        ext = float(np.linalg.norm(np.ptp(m.V[used], axis=0))) or 1.0
+        mp, newV = {}, []
+        for v in used:
+            if weld and abs(float((m.V[v] - c) @ n)) < 1e-5 * ext:
+                mp[v] = v                                  # on the plane: shared with the original
+            else:
+                mp[v] = len(m.V) + len(newV)
+                newV.append(MI.reflect(m.V[v], c, n))
+        if newV:
+            m.V = np.vstack([m.V, np.array(newV)])
+        new = [m.add_face([mp[v] for v in reversed(m.F[i])], tag) for i in fids]
+        return new, np.array(used, int), np.array([mp[v] for v in used], int)
+
+    def _remap_selection(self, vmap, fmap):
+        if self.mode == "v":
+            f = lambda i: vmap.get(i)
+        elif self.mode == "e":
+            f = lambda e: (vmap[e[0]], vmap[e[1]]) if e[0] in vmap and e[1] in vmap else None
+        else:
+            f = lambda i: fmap.get(i)
+        self.mir_src = [fmap[i] for i in self.mir_src if i in fmap]
+        self.sel = {r for r in (f(i) for i in self.sel) if r is not None}
+        self.sel_trail = [r for r in (f(i) for i in self.sel_trail) if r is not None and r in self.sel]
+
+    def update_mirrors(self):
+        """Keep every linked mirror body equal to the mirror image of its original: moves follow directly,
+        and when the original's shape changed (extrude, subdivide, re-fit...) the mirrored body is rebuilt."""
+        if self._mir_busy or not self.mirrors:
+            return
+        self._mir_busy = True
+        try:
+            m = self.mesh
+            stamp = (len(m.V), len(m.F))
+            ok = all(L.get("stamp") == stamp and L.get("src_vs") is not None and len(L["src_vs"])
+                     and max(L["src_vs"].max(), L["dst_vs"].max()) < len(m.V) for L in self.mirrors)
+            if ok:
+                for L in self.mirrors:
+                    sv, dv = L["src_vs"], L["dst_vs"]
+                    k = dv != sv
+                    m.V[dv[k]] = MI.reflect(m.V[sv[k]], np.asarray(L["c"], float), np.asarray(L["n"], float))
+                return
+            for L in list(self.mirrors):                       # rebuild
+                T = np.asarray(m.T)
+                sf = np.flatnonzero(np.isin(T, L["src"]))
+                df = np.flatnonzero(T == L["dst"])
+                if not len(sf) or not len(df):                 # the original or the mirror was deleted: the link ends
+                    self.mirrors.remove(L)
+                    continue
+                vmap, fmap = m.drop_faces(df)
+                for O in self.mirrors:                         # indices of the other links moved too
+                    if O is not L and O.get("src_vs") is not None:
+                        try:
+                            O["src_vs"] = np.array([vmap[i] for i in O["src_vs"]], int)
+                            O["dst_vs"] = np.array([vmap[i] for i in O["dst_vs"]], int)
+                        except KeyError:
+                            O["src_vs"] = None
+                new, sv, dv = self._mir_append([fmap[i] for i in sf], np.asarray(L["c"], float), np.asarray(L["n"], float),
+                                               L["weld"], L["dst"])
+                L["src_vs"], L["dst_vs"] = sv, dv
+                self._remap_selection(vmap, fmap)
+            stamp = (len(m.V), len(m.F))
+            for L in self.mirrors:
+                L["stamp"] = stamp
+            self._mir_cache = None
+        finally:
+            self._mir_busy = False
+        self.selection_changed.emit(); self.bodies_changed.emit(); self.mirror_changed.emit()
+
+    def mir_unlink(self, i=None):
+        if i is None:
+            self.mirrors = []
+        elif 0 <= i < len(self.mirrors):
+            del self.mirrors[i]
+        self.mirror_changed.emit()
+
+    def _draw_mirror(self, dpr):
+        if self.tool != "mirror" or not self.mir_valid():
+            return
+        tri, edges = self.mir_geometry()
+        if not len(tri):
+            return
+        c, n = self.mir_plane()
+        u, w = MI.basis(n)
+        P = self.mir_src_points()
+        cen = P.mean(0)
+        cen = cen - ((cen - c) @ n) * n
+        h = 0.75 * float(np.linalg.norm(np.ptp(P, axis=0))) + 1e-9
+        quad = [cen + (u * a + w * b) * h for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glColor4f(0.3, 0.7, 1.0, 0.16)
+        glBegin(GL_QUADS)
+        for q in quad:
+            glVertex3f(*q)
+        glEnd()
+        glColor4f(0.4, 0.8, 1.0, 1.0); glLineWidth(2.0 * dpr)
+        glBegin(GL_LINE_LOOP)
+        for q in quad:
+            glVertex3f(*q)
+        glEnd()
+        glBegin(GL_LINES)                                   # the normal
+        glVertex3f(*cen); glVertex3f(*(cen + n * 0.25 * h))
+        glEnd()
+        R = MI.reflect(tri.reshape(-1, 3), c, n).astype(np.float32)
+        glColor4f(1.0, 0.4, 0.85, 0.20)                     # the mirrored ghost
+        glEnableClientState(GL_VERTEX_ARRAY)
+        glVertexPointer(3, GL_FLOAT, 0, R)
+        glDrawArrays(GL_TRIANGLES, 0, len(R))
+        glDisableClientState(GL_VERTEX_ARRAY)
+        used = np.unique(edges)
+        RV = np.zeros((len(self.mesh.V), 3), np.float32)
+        RV[used] = MI.reflect(self.mesh.V[used], c, n)
+        glColor4f(1.0, 0.45, 0.9, 1.0); glLineWidth(1.8 * dpr)
+        glBegin(GL_LINES)
+        for a, b in edges:
+            glVertex3f(*RV[a]); glVertex3f(*RV[b])
+        glEnd()
+        glColor4f(0.35, 1.0, 0.5, 1.0); glLineWidth(2.5 * dpr)   # the bodies that will be mirrored
+        glBegin(GL_LINES)
+        for a, b in edges:
+            glVertex3f(*self.mesh.V[a]); glVertex3f(*self.mesh.V[b])
+        glEnd()
+        glDisable(GL_BLEND)
+
+    # ------------------------------------------------------------ constraints
+    def con_pick_at(self, x, y):
+        """What a click would pick: ('v'|'e'|'f', vertex ids, position) - a vertex first, then an edge, then a face."""
+        m = self.mesh
+        kinds = "vef" if self.con_auto else self.mode          # Auto, or whatever the Vertex / Edge / Face mode says
+        i = pick_mesh_vertex(self.cam, m.V, x, y, self.snap_radius) if "v" in kinds else None
+        if i is not None:
+            return ("v", (int(i),), m.V[i].copy())
+        hit = self._pick_edge(x, y) if "e" in kinds else None
+        if hit is not None:
+            a, b = self.mesh_edges()[hit[0]]
+            return ("e", (int(a), int(b)), (m.V[a] + m.V[b]) / 2)
+        fi = pick_mesh_face(self.cam, m, x, y) if "f" in kinds else None
+        if fi is not None:
+            f = [int(i) for i in m.F[fi]]
+            return ("f", tuple(f), m.V[f].mean(0))
+        return None
+
+    def con_hover(self, x, y):
+        self.snap = None
+        self.con_hit = self.con_pick_at(x, y)
+
+    def con_click(self, x, y):
+        h = self.con_pick_at(x, y)
+        if h is None:
+            return self.msg("Click a vertex, an edge or a face of a shape")
+        if any(p[0] == h[0] and set(p[1]) == set(h[1]) for p in self.pending):
+            return self.msg("Already picked")
+        self.pending.append(h)
+        if len(self.pending) >= CON_AUTO.get(self.con_kind, 99):
+            return self.finish_constraint()
+        self.update_hud(); self.update(); self.state_changed.emit()
+        self.msg("%d picked - the first one stays, the rest move. Enter = apply" % len(self.pending))
+
+    def set_con_kind(self, k):
+        if k in C.KINDS and k != self.con_kind:
+            self.con_kind = k
+            self.pending.clear()
+        self.update_hud(); self.update(); self.state_changed.emit()
+
+    def finish_constraint(self):
+        P, kind, V = self.pending, self.con_kind, self.mesh.V
+        if not P:
+            return
+        ents = [C.make_entity(V, t, vs) for t, vs, _ in P]
+        if kind == "fixed":
+            groups = [ents]
+        elif kind == "align":
+            groups = [[e] for e in ents]
+        elif kind == "distance" and len(ents) == 1:
+            groups = [ents]
+        else:
+            if len(ents) < 2:
+                return self.msg("Pick at least 2 objects (the first one stays put)")
+            groups = [[ents[0], e] for e in ents[1:]]
+        for g in groups:
+            bad = C.check_types(kind, g)
+            if bad:
+                return self.msg(bad)
+        self.push_undo()
+        new = []
+        for g in groups:
+            c = dict(kind=kind, ents=g, value=None, on=True, rigid=self.con_rigid)
+            if kind == "distance" or kind == "angle":
+                c["value"] = self.con_value if self.con_custom else C.current_value(V, c)
+            elif kind == "align":
+                c["value"] = int(self.con_axis)
+            new.append(c)
+        self.constraints.extend(new)
+        self.pending = []
+        self.con_sel = len(self.constraints) - 1
+        self._con_nv, self._con_nf = len(V), len(self.mesh.F)
+        self.changed()
+        bad = [self.con_status[i] for i in range(len(self.constraints) - len(new), len(self.constraints))
+               if i < len(self.con_status) and self.con_status[i] not in ("ok", None)]
+        self.msg("%d constraint%s added%s" % (len(new), "" if len(new) == 1 else "s", " - problem: " + bad[0] if bad else ""))
+        self.selection_changed.emit(); self.constraints_changed.emit(); self.update_hud(); self.state_changed.emit()
+
+    def solve_constraints(self):
+        """Re-find the constraints' vertices if the mesh was re-numbered, then move geometry so they hold."""
+        if self._con_busy or not self.constraints:
+            return
+        self._con_busy = True
+        try:
+            m = self.mesh
+            if len(m.V) != self._con_nv or len(m.F) != self._con_nf:
+                ext = float(np.linalg.norm(np.ptp(m.V, axis=0))) if len(m.V) else 1.0
+                n0 = len(self.constraints)
+                self.constraints = C.remap(m.V, self.constraints, 1e-6 * max(ext, 1e-9) + 1e-9)
+                if len(self.constraints) < n0:
+                    self.msg("%d constraint%s removed - the geometry it used is gone" % (n0 - len(self.constraints), "" if n0 - len(self.constraints) == 1 else "s"))
+                self.con_sel = None
+                self._con_nv, self._con_nf = len(m.V), len(m.F)
+                self.constraints_changed.emit()
+            if m.V.dtype != np.float64:
+                m.V = m.V.astype(np.float64)
+            st = C.solve(m.V, m.F, self.constraints)
+            C.refresh(m.V, self.constraints)
+            if st != self.con_status:
+                self.con_status = st
+                self.constraints_changed.emit()
+        finally:
+            self._con_busy = False
+
+    def con_text(self, i):
+        c, V = self.constraints[i], self.mesh.V
+        s = "%s: %s" % (C.LABEL[c["kind"]], C.describe(c))
+        if c["kind"] == "distance":
+            s += "  = " + self.meas_fmt(c["value"], "len")
+        elif c["kind"] == "angle":
+            s += "  = " + self.meas_fmt(c["value"], "deg")
+        elif c["kind"] == "align":
+            s += "  -> " + "XYZ"[int(c["value"])]
+        st = self.con_status[i] if i < len(self.con_status) else None
+        if not c.get("on", True):
+            s += "  [off]"
+        elif st not in ("ok", None):
+            s += "  [!] " + st
+        return s
+
+    def set_con_sel(self, i):
+        self.con_sel = i if (i is not None and 0 <= i < len(self.constraints)) else None
+        self.update()
+
+    def delete_constraint(self):
+        i = self.con_sel
+        if i is None or i >= len(self.constraints):
+            return self.msg("Select a constraint in the list first")
+        self.push_undo()
+        del self.constraints[i]
+        self.con_status = []
+        self.con_sel = None
+        self.changed(); self.constraints_changed.emit(); self.state_changed.emit()
+
+    def clear_constraints(self):
+        if not self.constraints:
+            return
+        self.push_undo()
+        self.constraints, self.con_status, self.con_sel = [], [], None
+        self.update(); self.constraints_changed.emit(); self.state_changed.emit()
+
+    def toggle_constraint(self):
+        i = self.con_sel
+        if i is None or i >= len(self.constraints):
+            return self.msg("Select a constraint in the list first")
+        self.push_undo()
+        c = self.constraints[i]
+        c["on"] = not c.get("on", True)
+        self.con_status = []
+        self.changed(); self.constraints_changed.emit(); self.state_changed.emit()
+
+    def set_constraint_value(self, value):
+        """Change the distance / angle of the selected dimension constraint and re-solve."""
+        i = self.con_sel
+        if i is None or i >= len(self.constraints) or self.constraints[i]["kind"] not in C.HAS_VALUE:
+            return self.msg("Select a distance, angle or align constraint in the list first")
+        self.push_undo()
+        self.constraints[i]["value"] = int(value) if self.constraints[i]["kind"] == "align" else float(value)
+        self.con_status = []
+        self.changed(); self.constraints_changed.emit(); self.state_changed.emit()
+
+    def con_ent_prims(self, e):
+        V = self.mesh.V
+        if any(i >= len(V) for i in e["vs"]):
+            return []
+        P = V[e["vs"]]
+        return [("pt", P)] if e["t"] == "v" else [("line" if e["t"] == "e" else "loop", P)]
+
+    def con_anchor_pos(self, e):
+        V = self.mesh.V
+        return V[[i for i in e["vs"] if i < len(V)]].mean(0) if any(i < len(V) for i in e["vs"]) else None
+
+    def shift_constraints(self, delta):
+        C.shift(self.constraints, np.asarray(delta, float))
+
     def mesh_edges(self):
         """All mesh edges as an (E, 2) array (cached until the mesh changes)."""
         tri = self.mesh.triangulate()[0]
@@ -659,6 +1256,7 @@ class Viewer(QOpenGLWidget):
         self.mp_pts = self.mp_preview = self.mp_lines = None
         self.mp_info = ""
         self.lasso, self.lasso_w, self.lasso_on = [], [], False
+        self.poly_active, self.poly_cursor = False, None
         self._mp_timer.stop()
 
     def _lasso_world(self, x, y):
@@ -667,12 +1265,55 @@ class Viewer(QOpenGLWidget):
         p = ray_plane(o, d, self.cam.target, self.cam.forward())
         return o + d * self.cam.dist if p is None else p
 
+    def poly_click(self, x, y, add, sub):
+        """Polygon selection (like CloudCompare's segment tool): every click adds a corner."""
+        if not self.poly_active:
+            self.poly_active, self.lasso, self.lasso_w = True, [], []
+            self.lasso_add, self.lasso_sub = add, sub
+        self.lasso.append((x, y))
+        self.lasso_w.append(self._lasso_world(x, y))
+        self.poly_cursor = None
+        self.msg("%d corner%s - keep clicking, right-click (or Enter) to close the polygon, Backspace removes the last corner"
+                 % (len(self.lasso), "" if len(self.lasso) == 1 else "s"))
+        self.update_hud(); self.update(); self.state_changed.emit()
+
+    def poly_close(self):
+        if not self.poly_active:
+            return
+        if len(self.lasso) < 3:
+            return self.msg("A polygon needs at least 3 corners")
+        self.poly_active, self.poly_cursor = False, None
+        self.finish_lasso()
+
+    def poly_undo(self):
+        if self.poly_active and self.lasso:
+            self.lasso.pop(); self.lasso_w.pop()
+            if not self.lasso:
+                self.poly_active = False
+            self.update_hud(); self.update(); self.state_changed.emit()
+
     def finish_lasso(self):
-        poly, add = np.array(self.lasso, float), self.lasso_add
-        self.lasso, self.lasso_w, self.lasso_on = [], [], False
+        poly, add, sub = np.array(self.lasso, float), self.lasso_add, self.lasso_sub
+        self.lasso, self.lasso_w, self.lasso_on, self.poly_active, self.poly_cursor = [], [], False, False, None
         self.update()
         if len(poly) < 3:
-            return self.msg("Drag a loop around the cloud points to build a mesh from")
+            return self.msg("Draw a polygon (click its corners, right-click to close) or drag a loop around the cloud points")
+        if sub:                                            # Ctrl: take points out of the current selection
+            if self.mp_pts is None:
+                return self.msg("Nothing selected yet - select points first, then Ctrl+polygon removes some")
+            sx, sy, _, w = self.cam.project(self.mp_pts)
+            inside = np.zeros(len(self.mp_pts), bool)
+            box = ((sx >= poly[:, 0].min()) & (sx <= poly[:, 0].max()) & (sy >= poly[:, 1].min()) & (sy <= poly[:, 1].max()))
+            idx = np.flatnonzero(box)
+            if idx.size:
+                inside[idx[points_in_polygon(np.c_[sx[idx], sy[idx]], poly)]] = True
+            keep = self.mp_pts[~inside]
+            if len(keep) < 4:
+                self.mp_clear()
+                self.update_hud(); self.update(); self.state_changed.emit()
+                return self.msg("Selection is now empty")
+            self.mp_pts = keep
+            return self.build_mp_preview()
         if self.cloud_full is None:
             return self.msg("Load a point cloud first (and make sure it is visible)")
         pts = self.cloud_full
@@ -682,8 +1323,8 @@ class Viewer(QOpenGLWidget):
         idx = np.flatnonzero(box)
         if idx.size:
             idx = idx[points_in_polygon(np.c_[sx[idx], sy[idx]], poly)]
-        if idx.size < 30:
-            return self.msg("Only %d points inside the loop - lasso more of the cloud (30+ needed)" % idx.size)
+        if idx.size < 4:
+            return self.msg("Only %d points inside the shape - draw it around more of the cloud" % idx.size)
         sel = pts[idx].astype(np.float64)
         if add and self.mp_pts is not None:
             sel = np.unique(np.vstack([self.mp_pts, sel]), axis=0)
@@ -699,24 +1340,34 @@ class Viewer(QOpenGLWidget):
         if self.mp_pts is None:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        note = ""
         try:
             self.msg("Building mesh from %s points..." % format(len(self.mp_pts), ","))
             QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-            V, F, info = poisson_mesh(self.mp_pts, self.mp_detail, self.mp_max_tris, self.mp_trim,
-                                      getattr(self, "mp_eye", None), self.mp_orient)
+            eye = getattr(self, "mp_eye", None)
+            if self.mp_method == "poisson":
+                try:
+                    V, F, info = poisson_mesh(self.mp_pts, self.mp_detail, self.mp_max_tris, self.mp_trim, eye, self.mp_orient)
+                except ImportError:                        # no Open3D installed: still give a result
+                    V, F, info = delaunay_mesh(self.mp_pts, "best", self.mp_max_edge, self.mp_max_tris, eye)
+                    note = "Open3D is not installed (pip install open3d), so Poisson is unavailable - this is Delaunay 2.5D instead. "
+            else:
+                V, F, info = delaunay_mesh(self.mp_pts, "xy" if self.mp_method == "delaunay_xy" else "best",
+                                           self.mp_max_edge, self.mp_max_tris, eye)
         except (ValueError, ImportError) as ex:
             self.mp_preview = self.mp_lines = None
+            self.mp_info = "Could not build a mesh: %s" % ex
             self.update_hud(); self.update(); self.state_changed.emit()
-            return self.msg(str(ex))
+            return self.msg(self.mp_info)
         finally:
             QApplication.restoreOverrideCursor()
         Fa = np.asarray(F, int)
         E = np.sort(np.concatenate([Fa[:, [0, 1]], Fa[:, [1, 2]], Fa[:, [2, 0]]]), axis=1)
         E = np.unique(E, axis=0)
-        self.mp_preview, self.mp_info = (V, F), info
+        self.mp_preview, self.mp_info = (V, F), note + info
         self.mp_lines = np.ascontiguousarray(V[E].reshape(-1, 3), np.float32)
         self.update_hud(); self.update(); self.state_changed.emit()
-        self.msg(info + "  -  Enter / 'Add mesh to model' keeps it; change Detail to refine")
+        self.msg(note + info + "  -  Enter / 'Add mesh to model' keeps it")
 
     def commit_mp(self):
         if self.mp_preview is None:
@@ -724,7 +1375,7 @@ class Viewer(QOpenGLWidget):
         V, F = self.mp_preview
         self.sync_bodies()
         self.push_undo()
-        body = self.reg.new_body("Poisson mesh", "mesh")
+        body = self.reg.new_body("Mesh" if self.mp_method != "poisson" else "Poisson mesh", "mesh")
         replace_faces(self.mesh, [], V, F, tag=body.id)
         n = len(F)
         self.mp_clear()
@@ -755,15 +1406,23 @@ class Viewer(QOpenGLWidget):
         for bid in [b.id for b in reg.bodies.values() if b.state == "live"]:
             if bid not in used and not reg.is_result(bid):
                 del reg.bodies[bid]
+        for k in [k for k in reg.merges if k not in reg.bodies]:
+            del reg.merges[k]
 
     def body_faces(self, bid):
         return [i for i, t in enumerate(self.mesh.T) if t == bid]
 
-    def select_body(self, bid):
+    def select_body(self, bid, add=False):
+        """Select a body's faces. add=True (Ctrl / Shift+click in the Bodies list): toggle it in the current selection."""
         b = self.reg.bodies.get(bid)
         if b is None or b.state != "live":
             return
-        self.mode, self.sel, self.sel_trail = "f", set(self.body_faces(bid)), []
+        fs = set(self.body_faces(bid))
+        if add and self.mode == "f" and self.sel:
+            self.sel = (self.sel - fs) if fs <= self.sel else (self.sel | fs)
+            self.sel_trail = [i for i in self.sel_trail if i in self.sel]
+        else:
+            self.mode, self.sel, self.sel_trail = "f", fs, []
         self._arr = None
         self.update_hud(); self.update(); self.selection_changed.emit(); self.state_changed.emit()
 
@@ -827,6 +1486,47 @@ class Viewer(QOpenGLWidget):
         self.mode, self.sel, self.sel_trail = "f", set(ids), []
         self.changed(); self.selection_changed.emit(); self.bodies_changed.emit()
         self.msg("%s undone - the original solids are back" % f.name)
+
+    def rename_item(self, kind, ident, name):
+        """Rename a body, boolean folder or point cloud (bodies and folders are undoable)."""
+        if kind == "cloud":
+            if 0 <= ident < len(self.clouds):
+                self.clouds[ident]["name"] = name
+        else:
+            self.sync_bodies()
+            obj = (self.reg.folders if kind == "folder" else self.reg.bodies).get(ident)
+            if obj is None:
+                return
+            self.push_undo()
+            obj.name = name
+        self.bodies_changed.emit(); self.state_changed.emit()
+        self.msg("Renamed to '%s'" % name)
+
+    def undo_merge(self, bid):
+        """Replace a merged body by the bodies it was merged from (as they were when merged)."""
+        self.sync_bodies()
+        reg, m = self.reg, self.mesh
+        parts = reg.merges.get(bid)
+        b = reg.bodies.get(bid)
+        if not parts or b is None:
+            return self.msg("This body was not made by Merge, so there is nothing to undo")
+        if b.state != "live":
+            return self.msg("Show the merged body first (tick it in the Bodies list), then undo the merge")
+        self.push_undo()
+        faces = self.body_faces(bid)
+        if faces:
+            m.drop_faces(faces)
+        del reg.bodies[bid]
+        del reg.merges[bid]
+        ids = []
+        for q in parts:
+            nb = Body(q["id"], q["name"], q["kind"], copy.deepcopy(q["src"]))
+            reg.bodies[nb.id] = nb
+            ids += replace_faces(m, [], q["V"].copy(), [list(f) for f in q["F"]], tag=nb.id)
+        self.mode, self.sel, self.sel_trail = "f", set(ids), []
+        self.mir_src = []
+        self.changed(); self.selection_changed.emit(); self.bodies_changed.emit(); self.state_changed.emit()
+        self.msg("Merge undone - %d bodies are back as they were when merged (edits made to the merged body since are not kept)" % len(parts))
 
     # --- editing the points a solid was made from
     def edit_body_points(self, bid):
@@ -935,7 +1635,9 @@ class Viewer(QOpenGLWidget):
             self.editing = None
         self.pending.clear()
         self.drag = None
-        self.snap, self.meas_hover = None, None
+        self.snap, self.meas_hover, self.con_hit, self.mir_drag = None, None, None, None
+        if t == "mirror":
+            self.mir_use_selection(quiet=True)
         if t != "mesh":
             self.mp_clear()
         self.update_hud()
@@ -960,6 +1662,7 @@ class Viewer(QOpenGLWidget):
     def set_mode(self, m):
         vs = set(self.sel_verts())
         self.sel_trail = []
+        self.con_auto = False
         self.mode = m
         if m == "v":
             self.sel = vs
@@ -1121,6 +1824,9 @@ class Viewer(QOpenGLWidget):
         self.mesh.V = self.mesh.V + delta                  # keep existing model aligned
         self.reg.shift(delta)
         self.shift_measures(delta)
+        self.shift_constraints(delta)
+        for L in self.mirrors:
+            L["c"] = np.asarray(L["c"], float) + delta
         taken = {c["name"] for c in self.clouds}
         for name, a in loaded:
             base, n = name, 2
@@ -1133,6 +1839,10 @@ class Viewer(QOpenGLWidget):
             self.mesh = Mesh.plane((0, 0, 0), max(0.4 * max(ext[0], ext[1]), 1e-3))
             self.reg = Registry()
             self.sel = set()
+            self.mirrors = []
+            self.constraints, self.con_status, self.con_sel = [], [], None
+            self._con_nv, self._con_nf = len(self.mesh.V), len(self.mesh.F)
+            self.constraints_changed.emit()
             if not append:                                 # a fresh start: old measurements belong to the old cloud
                 self.measures, self.meas_sel = [], None
                 self.measures_changed.emit()
@@ -1251,11 +1961,19 @@ class Viewer(QOpenGLWidget):
             elif st["skipped"]:
                 note = "%d edge(s) kept - they cannot be dissolved cleanly" % st["skipped"]
         else:
-            self.mesh.delete_faces(self.sel)
+            _, fm = self.mesh.drop_faces(self.sel)         # also removes the vertices only those faces used
+            self.mir_src = [fm[i] for i in self.mir_src if i in fm]
         self.sel = set()
         self.changed(); self.selection_changed.emit()
         if note:
             self.msg(note)
+
+    def op_clean_vertices(self):
+        self.push_undo()
+        n = self.mesh.remove_unused_vertices()
+        self.sel, self.sel_trail = set(), []
+        self.changed(); self.selection_changed.emit()
+        self.msg("Removed %d unused vertices" % n if n else "No unused vertices found")
 
     def boolean_shells(self):
         """Solids touched by the selection, in the order they were picked (click, Shift+click...)."""
@@ -1314,6 +2032,87 @@ class Viewer(QOpenGLWidget):
         self.msg(info + ("  [first-picked solid minus the others]" if kind == "difference" else "") + note
                  + "  - undo it from its folder in the Bodies list")
 
+    def op_merge(self):
+        """Merge the selected bodies into one by stitching them at their vertices, edges and faces (no re-meshing)."""
+        self.sync_bodies()
+        shells = self.boolean_shells()
+        if len(shells) < 2:
+            return self.msg("Merge needs two or more bodies: click one, then Ctrl+click the others in the Bodies list (or Shift+click in the view)")
+        m = self.mesh
+        fids = [i for s_ in shells for i in s_]
+        used = sorted({v for i in fids for v in m.F[i]})
+        mp = {v: k for k, v in enumerate(used)}
+        Vl = m.V[used]
+        Fl = [[mp[v] for v in m.F[i]] for i in fids]
+        Bl = [k for k, s_ in enumerate(shells) for _ in s_]
+        tol = self.merge_tol or 0.002 * float(np.linalg.norm(np.ptp(Vl, axis=0)))
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            V2, F2, B2, st = ST.merge(Vl, Fl, Bl, tol, self.merge_bridge)
+        except Exception as ex:
+            return self.msg("Could not merge: %s" % ex)
+        finally:
+            QApplication.restoreOverrideCursor()
+        # Bodies that overlap (cross through each other), or contacts the stitching could not close cleanly, need a real
+        # union: it finds the intersection curves. Closed solids only (and manifold3d installed).
+        used_union, union_note = False, ""
+        try:
+            solids = [split_loose(m, s_)[0] for s_ in shells]
+            Vu, Fu, _ = boolean_op(m, "union", solids)
+            vol_in = sum(abs(signed_volume(m.V, [m.F[i] for i in s_])) for s_ in solids)
+            overlap = vol_in - abs(signed_volume(Vu, Fu)) > 1e-6 * max(vol_in, 1e-30)
+            worse = self._edge_defects(F2) > self._edge_defects(Fl)
+            if overlap or worse:
+                V2, F2, B2 = Vu, Fu, None
+                used_union = True
+                union_note = ("the bodies overlap, so the overlapping parts were fused (union), keeping the rest as it was" if overlap else
+                              "the touching faces did not line up well enough to stitch, so they were fused (union)")
+        except (ValueError, ImportError):
+            pass                                           # open surfaces / no manifold3d: the stitched result stands
+        done = st["welded"] + st["tjoints"] + st["removed"] + st["contacts"] + st["bridged"] + int(used_union)
+        if not done:
+            return self.msg("Nothing to stitch: the bodies don't touch within %.4g. Raise the tolerance, or use 'Bridge gaps up to' for bodies with a gap%s"
+                            % (tol, "  (shapely is not installed - pip install shapely - needed for faces that overlap)" if st.get("no_shapely") else ""))
+        self.push_undo()
+        parts = []                                         # remembered so "Undo merge" can give the bodies back
+        for t in sorted({m.T[i] for i in fids}):
+            b0 = self.reg.bodies.get(t)
+            if b0 is None:
+                continue
+            Vq, Fq = extract_faces(m, [i for i in fids if m.T[i] == t])
+            parts.append({"id": t, "name": b0.name, "kind": b0.kind, "src": copy.deepcopy(b0.src), "V": Vq, "F": Fq})
+        m.drop_faces(fids)
+        tag = self.reg.new_body("Merged", "mesh").id
+        if len(parts) > 1:
+            self.reg.merges[tag] = parts
+        base = len(m.V)
+        m.V = np.vstack([m.V, V2])
+        new = [m.add_face([base + i for i in f], tag) for f in F2]
+        self.mode, self.sel, self.sel_trail = "f", set(new), []
+        self.mir_src = []
+        self.changed(); self.selection_changed.emit(); self.bodies_changed.emit(); self.state_changed.emit()
+        parts = [("welded %d vertices", st["welded"]), ("%d vertices set into edges", st["tjoints"]),
+                 ("%d touching faces removed", st["removed"]), ("%d overlapping contacts stitched", st["contacts"]),
+                 ("%d gaps bridged", st["bridged"])]
+        note = "; ".join(t % n for t, n in parts if n)
+        if st["unresolved"]:
+            note += "; %d contacts could not be stitched (try Union for those)" % st["unresolved"]
+        if st.get("no_shapely"):
+            note += "; faces that only partly overlap were skipped - pip install shapely to stitch them"
+        if used_union:
+            note = union_note
+        self.msg("Merged %d bodies into one: %s" % (len(shells), note))
+
+    @staticmethod
+    def _edge_defects(F):
+        """Edges that are open or shared by more than two faces (0 for a clean closed surface)."""
+        d = {}
+        for f in F:
+            for i in range(len(f)):
+                e = (f[i], f[(i + 1) % len(f)])
+                d[e] = d.get(e, 0) + 1
+        return sum(1 for (a, b), c in d.items() if c != 1 or (b, a) not in d)
+
     def op_flip(self):
         fs = self.sel_faces()
         if not fs:
@@ -1346,6 +2145,9 @@ class Viewer(QOpenGLWidget):
         self.sync_bodies()
         save_model(path, self.mesh, self.origin, extra={
             "bodies": self.reg.to_dict(), "measurements": self.measures_to_json(),
+            "constraints": C.to_json(self.constraints),
+            "mirrors": [dict(src=[int(i) for i in L["src"]], dst=int(L["dst"]), c=np.asarray(L["c"], float).tolist(),
+                             n=np.asarray(L["n"], float).tolist(), weld=bool(L["weld"])) for L in self.mirrors],
             "measure_format": dict(units=self.meas_units, scale=self.meas_scale, dec=self.meas_dec)})
 
     def open_model(self, path):
@@ -1364,13 +2166,19 @@ class Viewer(QOpenGLWidget):
         self.reg = Registry.from_dict(reg_data)
         self.reg.shift(shift)
         self.measures_from_json(data.get("measurements"), shift)
+        self.constraints = C.from_json(data.get("constraints"))
+        self.shift_constraints(shift)
+        self.con_status, self.con_sel = [], None
+        self._con_nv, self._con_nf = len(self.mesh.V), len(self.mesh.F)
+        self.mirrors = [dict(src=list(d["src"]), dst=d["dst"], c=np.array(d["c"], float) + shift, n=np.array(d["n"], float),
+                             weld=bool(d.get("weld")), stamp=None, src_vs=None, dst_vs=None) for d in data.get("mirrors") or []]
         fmt = data.get("measure_format") or {}
         self.meas_units, self.meas_scale, self.meas_dec = fmt.get("units", ""), float(fmt.get("scale", 1.0)), int(fmt.get("dec", 3))
         self.sel, self.editing, self.pending = set(), None, []
         self.pristine = False
         self.sync_bodies()
         self.changed(); self.selection_changed.emit(); self.bodies_changed.emit()
-        self.measures_changed.emit(); self.state_changed.emit()
+        self.measures_changed.emit(); self.constraints_changed.emit(); self.mirror_changed.emit(); self.state_changed.emit()
 
     def export_obj(self, path, original_coords):
         self.mesh.export_obj(path, self.origin if original_coords else np.zeros(3))
@@ -1474,13 +2282,25 @@ class Viewer(QOpenGLWidget):
             self.nav = "pan" if shift else "orbit"
         elif b == Qt.MouseButton.RightButton:
             self.nav = "pan"
+            self._rpress = (x, y)
         elif b == Qt.MouseButton.LeftButton:
             if self.tool == "measure":
                 self.measure_click(x, y, bool(m & Qt.KeyboardModifier.ControlModifier))
+            elif self.tool == "constrain":
+                self.con_click(x, y)
+            elif self.tool == "mirror":
+                if m & Qt.KeyboardModifier.ControlModifier:
+                    self.mir_click_body(x, y, shift)
+                else:
+                    self.mir_press(x, y, shift)
             elif self.tool == "mesh":
-                self.lasso, self.lasso_on, self.lasso_add = [(x, y)], True, shift
-                self.lasso_w = [self._lasso_world(x, y)]
-                self.update()
+                ctrl = bool(m & Qt.KeyboardModifier.ControlModifier)
+                if self.mp_select == "polygon" or self.poly_active:
+                    self.poly_click(x, y, shift, ctrl)
+                else:
+                    self.lasso, self.lasso_on, self.lasso_add, self.lasso_sub = [(x, y)], True, shift, ctrl
+                    self.lasso_w = [self._lasso_world(x, y)]
+                    self.update()
             elif self.tool == "select":
                 self.apply_pick(self.pick_element(x, y), shift)
             elif self.tool == "move":
@@ -1535,6 +2355,8 @@ class Viewer(QOpenGLWidget):
                 self.lasso.append((x, y))
                 self.lasso_w.append(self._lasso_world(x, y))
                 self.update()
+        elif self.mir_drag is not None:
+            self.mir_move(x, y)
         elif self.drag is not None:
             self.apply_drag(x, y, bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier))
         else:
@@ -1547,11 +2369,20 @@ class Viewer(QOpenGLWidget):
                 self.hover_axis = h[0] if h else None
             elif self.tool == "measure":
                 self.measure_hover(x, y, bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier))
+            elif self.tool == "constrain":
+                self.con_hover(x, y)
+            elif self.tool == "mesh" and self.poly_active:
+                self.poly_cursor = self._lasso_world(x, y)
             if self.tool != "select":
                 self.update()
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton and self.tool == "mesh" and self.poly_active and self._rpress is not None:
+            if np.hypot(e.position().x() - self._rpress[0], e.position().y() - self._rpress[1]) < 5:   # a click, not a pan
+                self.nav = None
+                return self.poly_close()
         self.nav = None
+        self.mir_drag = None
         if self.lasso_on and e.button() == Qt.MouseButton.LeftButton:
             self.finish_lasso()
             return
@@ -1582,13 +2413,19 @@ class Viewer(QOpenGLWidget):
         elif k in (K.Key_Return, K.Key_Enter) and self.tool == "solid":
             self.finish_solid()
         elif k in (K.Key_Return, K.Key_Enter) and self.tool == "mesh":
-            self.commit_mp()
+            self.poly_close() if self.poly_active else self.commit_mp()
         elif k in (K.Key_Return, K.Key_Enter) and self.tool == "measure":
             self.finish_measure()
+        elif k in (K.Key_Return, K.Key_Enter) and self.tool == "mirror":
+            self.mir_commit()
+        elif k in (K.Key_Return, K.Key_Enter) and self.tool == "constrain":
+            self.finish_constraint()
+        elif k == K.Key_Backspace and self.tool == "mesh" and self.poly_active:
+            self.poly_undo()
         elif k == K.Key_Backspace and self.pending:
             self.undo_pick()
         elif k == K.Key_Escape:
-            if self.tool == "mesh" and (self.lasso_on or self.mp_pts is not None):
+            if self.tool == "mesh" and (self.lasso_on or self.poly_active or self.mp_pts is not None):
                 self.mp_clear()
                 self.update_hud(); self.update(); self.state_changed.emit()
             elif self.drag is not None:
@@ -1620,6 +2457,23 @@ class Viewer(QOpenGLWidget):
             glBindBuffer(GL_ARRAY_BUFFER, 0)
             self.vbo = b
         self._cloud_dirty = False
+
+    def _scene_sphere(self):
+        """Bounding sphere of the point clouds and the model, so the camera's near / far planes always cover them."""
+        los, his = [], []
+        if self.cloud_full is not None and len(self.cloud_full):
+            if self._cloud_bounds is None or self._cloud_bounds[0] is not self.cloud_full:
+                self._cloud_bounds = (self.cloud_full, self.cloud_full.min(0).astype(float), self.cloud_full.max(0).astype(float))
+            los.append(self._cloud_bounds[1]); his.append(self._cloud_bounds[2])
+        V = self.mesh.V
+        if len(V):
+            ok = np.isfinite(V).all(axis=1)
+            if ok.any():
+                los.append(V[ok].min(0)); his.append(V[ok].max(0))
+        if not los:
+            return None
+        lo, hi = np.min(los, axis=0), np.max(his, axis=0)
+        return (lo + hi) / 2, 0.5 * float(np.linalg.norm(hi - lo)) + 1e-9
 
     def _build_arrays(self):
         m = self.mesh
@@ -1719,6 +2573,44 @@ class Viewer(QOpenGLWidget):
         glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_COLOR_MATERIAL)
         glDisable(GL_LIGHTING); glDisable(GL_BLEND)
 
+    def _draw_prims(self, prims, width, dpr, col):
+        glColor3f(*col)
+        for kind, P in prims:
+            if kind == "pt":
+                self._pts(np.ascontiguousarray(P, np.float32), 12, col)
+                glDisableClientState(GL_VERTEX_ARRAY)
+                continue
+            glLineWidth(width * dpr)
+            glBegin(GL_LINE_LOOP if kind == "loop" else GL_LINE_STRIP)
+            for q in P:
+                glVertex3f(*q)
+            glEnd()
+
+    def _draw_constraints(self, dpr):
+        if self.tool == "constrain":
+            if self.con_hit is not None:                   # what a click would pick
+                self._draw_prims(self.con_ent_prims(dict(t=self.con_hit[0], vs=list(self.con_hit[1]))), 4.0, dpr, (1.0, 0.95, 0.2))
+            for k, (t, vs, _) in enumerate(self.pending):  # first = stationary (green), the others move (orange)
+                self._draw_prims(self.con_ent_prims(dict(t=t, vs=list(vs))), 4.0, dpr, (0.3, 1.0, 0.4) if k == 0 else (1.0, 0.6, 0.15))
+        if not self.con_show:
+            return
+        for i, c in enumerate(self.constraints):
+            st = self.con_status[i] if i < len(self.con_status) else "ok"
+            hot = i == self.con_sel
+            if not c.get("on", True):
+                col = (0.5, 0.5, 0.55)
+            elif st not in ("ok", None):
+                col = (1.0, 0.25, 0.25)
+            else:
+                col = (0.35, 0.85, 1.0)
+            if hot:
+                for k, e in enumerate(c["ents"]):
+                    self._draw_prims(self.con_ent_prims(e), 4.0, dpr, (0.3, 1.0, 0.4) if k == 0 else (1.0, 0.6, 0.15))
+            pos = [self.con_anchor_pos(e) for e in c["ents"]]
+            if len(pos) >= 2 and pos[0] is not None and pos[-1] is not None:
+                glColor3f(*col); glLineWidth(1.5 * dpr)
+                glBegin(GL_LINES); glVertex3f(*pos[0]); glVertex3f(*pos[-1]); glEnd()
+
     def _draw_overlay(self, a):
         glDisable(GL_DEPTH_TEST)
         dpr = self.devicePixelRatioF()
@@ -1772,6 +2664,8 @@ class Viewer(QOpenGLWidget):
             self._pts(np.array([self.snap[2]], np.float32), 15,
                       {"mesh": (0.3, 1.0, 0.4), "edge": (0.3, 0.9, 1.0), "face": (0.3, 0.9, 1.0), "center": (1.0, 0.78, 0.2)}.get(self.snap[0], (1.0, 0.95, 0.2)))
         self._draw_measures(dpr)
+        self._draw_constraints(dpr)
+        self._draw_mirror(dpr)
         if self.tool == "mesh":
             if self.mp_pts is not None:                    # the lassoed points
                 self._pts(np.ascontiguousarray(self.mp_pts[::max(1, len(self.mp_pts) // 200_000)], np.float32),
@@ -1782,12 +2676,16 @@ class Viewer(QOpenGLWidget):
                 glVertexPointer(3, GL_FLOAT, 0, self.mp_lines)
                 glDrawArrays(GL_LINES, 0, len(self.mp_lines))
                 glDisableClientState(GL_VERTEX_ARRAY)
-        if len(self.lasso_w) > 1:                          # the lasso being drawn
+        if self.lasso_w:                                   # the lasso / polygon being drawn
+            pts = list(self.lasso_w) + ([self.poly_cursor] if self.poly_active and self.poly_cursor is not None else [])
             glColor3f(1.0, 0.9, 0.2); glLineWidth(2.0 * dpr)
-            glBegin(GL_LINE_LOOP)
-            for q in self.lasso_w:
-                glVertex3f(*q)
-            glEnd()
+            if len(pts) > 1:
+                glBegin(GL_LINE_LOOP if not self.poly_active or len(pts) > 2 else GL_LINE_STRIP)
+                for q in pts:
+                    glVertex3f(*q)
+                glEnd()
+            if self.poly_active:
+                self._pts(np.array(self.lasso_w, np.float32), 8, (1.0, 0.9, 0.2))
         glEnable(GL_DEPTH_TEST)
 
     def paintGL(self):
@@ -1801,6 +2699,7 @@ class Viewer(QOpenGLWidget):
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             if self._cloud_dirty:
                 self._upload_cloud()
+            self.cam.scene = self._scene_sphere()
             glMatrixMode(GL_PROJECTION)
             glLoadMatrixd(np.ascontiguousarray(self.cam.proj_matrix().T))
             glMatrixMode(GL_MODELVIEW)
@@ -1819,9 +2718,10 @@ class Viewer(QOpenGLWidget):
 
 
 # ============================================================== main window ==
-SEG_SHAPES = ("cylinder", "cone", "sphere", "loft", "extrude")   # shapes whose smoothness "Segments" controls
+SEG_SHAPES = ("cylinder", "cone", "sphere", "loft", "extrude", "revolve")   # shapes whose smoothness "Segments" controls
 TOOL_NAMES = {"select": "Select", "move": "Move / Transform", "points": "Face from points", "solid": "Best-fit solid",
-              "mesh": "Mesh from points", "measure": "Measure"}
+              "mesh": "Mesh from points", "measure": "Measure",
+              "constrain": "Constraints", "mirror": "Mirror body"}
 # edit buttons: (label, Viewer method, modes in which the button is shown)
 EDIT_OPS = (("Subdivide", "op_subdivide", "f", "Subdivide faces (S)"), ("Extrude", "op_extrude", "ef", "Extrude (E)"),
             ("Fill face", "op_fill", "v", "Fill a face from the selected vertices (F)"),
@@ -1904,6 +2804,9 @@ class MainWindow(QMainWindow):
         self.v.state_changed.connect(self.sync_checked)
         self.v.state_changed.connect(self.sync_solid_controls)
         self.v.measures_changed.connect(self.refresh_meas_list)
+        self.v.constraints_changed.connect(self.refresh_con_list)
+        self.v.mirror_changed.connect(self.refresh_mir)
+        self.v.selection_changed.connect(self.v.mir_follow_selection)
         self.refresh_coords()
         self.update_panel()
         self.statusBar().showMessage("File > Open point clouds (Ctrl+O) to begin, or drop files onto the window")
@@ -1945,7 +2848,7 @@ class MainWindow(QMainWindow):
 
         tg = QActionGroup(self)
         self.tool_acts = {}
-        for key, sc in (("select", "Q"), ("move", "W"), ("points", "P"), ("solid", "B"), ("mesh", "G"), ("measure", "R")):
+        for key, sc in (("select", "Q"), ("move", "W"), ("points", "P"), ("solid", "B"), ("mesh", "G"), ("measure", "R"), ("constrain", "K"), ("mirror", "T")):
             self.tool_acts[key] = self.act(TOOL_NAMES[key], sc, lambda k=key: self.v.set_tool(k), t, checkable=True, group=tg)
         self.tool_acts["move"].setChecked(True)
         t.addSeparator()
@@ -1969,6 +2872,8 @@ class MainWindow(QMainWindow):
         self.act("Extrude faces / edges", "E", self.v.op_extrude, md)
         self.act("Fill face from selected vertices", "F", self.v.op_fill, md)
         self.act("Weld selected vertices", "M", self.v.op_weld, md)
+        self.act("Merge selected bodies (stitch)", "Ctrl+J", self.v.op_merge, md)
+        self.act("Remove unused vertices (left over from deleted shapes)", "", self.v.op_clean_vertices, md)
         self.act("Flip normals", "N", self.v.op_flip, md)
         self.act("Snap selection to cloud surface", "Shift+S", self.v.op_snap_surface, md)
         md.addSeparator()
@@ -2005,7 +2910,7 @@ class MainWindow(QMainWindow):
         tb = self.addToolBar("Tools")
         tb.setMovable(False)
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        for key in ("select", "move", "points", "solid", "mesh", "measure"):
+        for key in ("select", "move", "points", "solid", "mesh", "measure", "constrain", "mirror"):
             a = self.tool_acts[key]
             a.setToolTip("%s (%s)" % (TOOL_NAMES[key], a.shortcut().toString()))
             tb.addAction(a)
@@ -2053,6 +2958,22 @@ class MainWindow(QMainWindow):
         self.sec_solid.setVisible(v.tool == "solid")
         self.sec_mesh.setVisible(v.tool == "mesh")
         self.sec_meas.setVisible(v.tool == "measure")
+        self.sec_con.setVisible(v.tool == "constrain")
+        self.sec_mir.setVisible(v.tool == "mirror")
+        if v.tool == "mirror":
+            self.refresh_mir()
+        if v.tool == "constrain":
+            i = self.con_kc.findData(v.con_kind)
+            if i >= 0 and self.con_kc.currentIndex() != i:
+                self.con_kc.blockSignals(True); self.con_kc.setCurrentIndex(i); self.con_kc.blockSignals(False)
+            self.con_help.setText(CON_HELP[v.con_kind])
+            hv = v.con_kind in ("distance", "angle")
+            self.con_custom_cb.setVisible(hv); self.con_val_row.setVisible(hv or v.con_kind == "align")
+            self.con_val_sp.setVisible(hv); self.con_axis_cb.setVisible(v.con_kind == "align")
+            self.con_val_sp.setSuffix("°" if v.con_kind == "angle" else (" " + v.meas_units if v.meas_units else ""))
+            self.con_apply_btn.setEnabled(bool(v.pending))
+            for k, b in self.con_mode_btns.items():
+                b.blockSignals(True); b.setChecked(v.con_auto if k == "a" else (not v.con_auto and v.mode == k)); b.blockSignals(False)
         if v.tool == "measure":
             i = self.meas_kc.findData(v.meas_kind)
             if i >= 0 and self.meas_kc.currentIndex() != i:
@@ -2065,6 +2986,12 @@ class MainWindow(QMainWindow):
             n = 0 if v.mp_pts is None else len(v.mp_pts)
             self.mp_lbl.setText("%s points selected" % format(n, ",") if n else "Nothing selected - drag a loop around cloud points")
             self.mp_info_lbl.setText(v.mp_info)
+            self.mp_poisson_box.setVisible(v.mp_method == "poisson")
+            self.mp_delaunay_box.setVisible(v.mp_method != "poisson")
+            for cb, key in ((self.mp_method_cb, v.mp_method), (self.mp_select_cb, v.mp_select)):
+                j = cb.findData(key)
+                if j >= 0 and cb.currentIndex() != j:
+                    cb.blockSignals(True); cb.setCurrentIndex(j); cb.blockSignals(False)
             self.mp_add_btn.setEnabled(v.mp_preview is not None)
         if edit:
             for k, b in self.mode_btns.items():
@@ -2113,6 +3040,20 @@ class MainWindow(QMainWindow):
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             gl.addWidget(b)
         gl.addWidget(_small("The result goes into a folder in the Bodies list - use its Undo button to split it again."))
+        mb = QPushButton("Merge / stitch (Ctrl+J)")
+        mb.setToolTip("Joins the bodies into one by welding their vertices, setting vertices into the other body's edges and removing "
+                      "faces that touch - the rest of each body keeps its own faces and vertices (no re-meshing, unlike Union).")
+        mb.clicked.connect(lambda: self.v.op_merge())
+        mb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        gl.addWidget(mb)
+        mt0 = QDoubleSpinBox(); mt0.setRange(0, 1e9); mt0.setDecimals(5); mt0.setSingleStep(0.001); mt0.setSpecialValueText("auto")
+        mt0.setKeyboardTracking(False); mt0.setToolTip("How close two vertices / edges / faces must be to count as touching. auto = 0.2% of the size.")
+        mt0.valueChanged.connect(lambda x: setattr(self.v, "merge_tol", x))
+        gl.addLayout(_row("Merge tolerance", mt0))
+        mg0 = QDoubleSpinBox(); mg0.setRange(0, 1e9); mg0.setDecimals(4); mg0.setSingleStep(0.1); mg0.setSpecialValueText("off")
+        mg0.setKeyboardTracking(False); mg0.setToolTip("Open rims (e.g. two tubes without end caps) that face each other across a gap up to this size get joined with a strip of faces.")
+        mg0.valueChanged.connect(lambda x: setattr(self.v, "merge_bridge", x))
+        gl.addLayout(_row("Bridge gaps up to", mg0))
         lay.addWidget(self.sec_bool)
 
         # ---- select / move
@@ -2223,6 +3164,29 @@ class MainWindow(QMainWindow):
         self.mp_lbl = QLabel("")
         self.mp_lbl.setWordWrap(True)
         gl.addWidget(self.mp_lbl)
+        sc = QComboBox()
+        sc.addItem("Polygon (click corners, right-click closes)", "polygon")
+        sc.addItem("Freehand (drag a loop)", "freehand")
+        sc.setToolTip("How you pick the points. Polygon works like CloudCompare's segment tool. Shift = add to the selection, Ctrl = remove from it.")
+        sc.activated.connect(lambda i, c=sc: (setattr(self.v, "mp_select", c.itemData(i)), self.v.mp_clear(), self.v.update_hud(), self.v.update(), self.update_panel()))
+        gl.addLayout(_row("Select with", sc))
+        mc0 = QComboBox()
+        mc0.addItem("Poisson reconstruction", "poisson")
+        mc0.addItem("Delaunay 2.5D - best-fit plane", "delaunay_best")
+        mc0.addItem("Delaunay 2.5D - XY plane (terrain)", "delaunay_xy")
+        mc0.setToolTip("Poisson: smooth watertight surface for objects (needs Open3D).\n"
+                       "Delaunay 2.5D: triangulates the points as a height field over a plane - best for terrain, walls and sheets.")
+        mc0.activated.connect(lambda i, c=mc0: (setattr(self.v, "mp_method", c.itemData(i)), self.v.schedule_mp(), self.update_panel()))
+        gl.addLayout(_row("Method", mc0))
+        self.mp_method_cb, self.mp_select_cb = mc0, sc
+        self.mp_poisson_box = QWidget(); pbl = QVBoxLayout(self.mp_poisson_box); pbl.setContentsMargins(0, 0, 0, 0); pbl.setSpacing(4)
+        self.mp_delaunay_box = QWidget(); dbl = QVBoxLayout(self.mp_delaunay_box); dbl.setContentsMargins(0, 0, 0, 0); dbl.setSpacing(4)
+        me = QDoubleSpinBox(); me.setRange(0, 1e9); me.setDecimals(4); me.setSingleStep(0.1); me.setSpecialValueText("auto")
+        me.setKeyboardTracking(False)
+        me.setToolTip("Triangles with an edge longer than this are dropped (so gaps and holes stay open). auto = about 4x the point spacing.")
+        me.valueChanged.connect(lambda x: (setattr(self.v, "mp_max_edge", x), self.v.schedule_mp()))
+        dbl.addLayout(_row("Max edge length", me))
+        gl.addWidget(self.mp_poisson_box); gl.addWidget(self.mp_delaunay_box)
         dl = QSlider(Qt.Orientation.Horizontal); dl.setRange(5, 11); dl.setValue(self.v.mp_detail)
         dl.setToolTip("Less detail = fewer, larger triangles and a smoother surface. More detail = finer surface, more triangles.")
         dtxt = QLabel()
@@ -2232,8 +3196,8 @@ class MainWindow(QMainWindow):
             self.v.schedule_mp()
         dl.valueChanged.connect(detail_changed)
         detail_changed(self.v.mp_detail)
-        gl.addLayout(_row("Detail", dtxt))
-        gl.addWidget(dl)
+        pbl.addLayout(_row("Detail", dtxt))
+        pbl.addWidget(dl)
         mt = QSpinBox(); mt.setRange(0, 1_000_000); mt.setSingleStep(5000); mt.setValue(self.v.mp_max_tris)
         mt.setSpecialValueText("no limit"); mt.setKeyboardTracking(False)
         mt.setToolTip("Upper limit on triangles - the mesh is simplified down to it. Very large meshes make the viewport slow.")
@@ -2245,11 +3209,11 @@ class MainWindow(QMainWindow):
         oc.setToolTip("Which way the surface faces. Auto: outward for an object that wraps around, "
                       "toward the view for a one-sided scan (terrain, wall).")
         oc.activated.connect(lambda i: (setattr(self.v, "mp_orient", oc.itemData(i)), self.v.schedule_mp()))
-        gl.addLayout(_row("Normals", oc))
+        pbl.addLayout(_row("Normals", oc))
         tc = QCheckBox("Trim stray surface"); tc.setChecked(self.v.mp_trim)
         tc.setToolTip("Cut away the skin that Poisson reconstruction invents where there are no points")
         tc.toggled.connect(lambda x: (setattr(self.v, "mp_trim", x), self.v.schedule_mp()))
-        gl.addWidget(tc)
+        pbl.addWidget(tc)
         self.mp_info_lbl = _small("")
         gl.addWidget(self.mp_info_lbl)
         self.mp_add_btn = QPushButton("Add mesh to model (Enter)")
@@ -2259,7 +3223,7 @@ class MainWindow(QMainWindow):
         cb = QPushButton("Clear selection (Esc)"); cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         cb.clicked.connect(lambda: (self.v.mp_clear(), self.v.update_hud(), self.v.update(), self.update_panel()))
         gl.addWidget(cb)
-        gl.addWidget(_small("Drag a loop around cloud points; Shift+drag adds more. The green wireframe is the mesh that will be added."))
+        gl.addWidget(_small("Polygon: click corners, right-click or Enter closes it, Backspace removes a corner. Shift+polygon adds more points, Ctrl+polygon removes some. The green wireframe is the mesh that will be added."))
         lay.addWidget(self.sec_mesh)
 
         # ---- measure
@@ -2267,7 +3231,7 @@ class MainWindow(QMainWindow):
         kc = QComboBox()
         for key in MEAS_MODES:
             kc.addItem(MEAS_LABELS[key], key)
-        kc.activated.connect(lambda i: self.v.set_meas_kind(kc.itemData(i)))
+        kc.activated.connect(lambda i, c=kc: self.v.set_meas_kind(c.itemData(i)))
         self.meas_kc = kc
         gl.addWidget(kc)
         self.meas_help = _small("")
@@ -2307,7 +3271,7 @@ class MainWindow(QMainWindow):
         for u in ("", "mm", "cm", "m", "km", "in", "ft"):
             uc.addItem(u or "(none)", u)
         uc.setToolTip("Name of the unit shown after the numbers")
-        uc.activated.connect(lambda i: self.v.set_meas_format(units=uc.itemData(i)))
+        uc.activated.connect(lambda i, c=uc: self.v.set_meas_format(units=c.itemData(i)))
         gl.addLayout(_row("Unit", uc))
         ss = QDoubleSpinBox(); ss.setRange(1e-9, 1e9); ss.setDecimals(6); ss.setValue(self.v.meas_scale)
         ss.setKeyboardTracking(False)
@@ -2319,6 +3283,126 @@ class MainWindow(QMainWindow):
         gl.addLayout(_row("Decimals", ds))
         self.meas_unit_cb, self.meas_scale_sp, self.meas_dec_sp, self.meas_show_cb = uc, ss, ds, sc_cb
         lay.addWidget(self.sec_meas)
+
+        # ---- constraints
+        self.sec_con, gl = self._group("Constraints")
+        kc = QComboBox()
+        for key in C.KINDS:
+            kc.addItem(C.LABEL[key], key)
+        kc.activated.connect(lambda i, c=kc: self.v.set_con_kind(c.itemData(i)))
+        self.con_kc = kc
+        gl.addWidget(kc)
+        gl.addWidget(_small("Pick"))
+        row = QHBoxLayout(); row.setSpacing(2)
+        self.con_mode_btns, grp = {}, QButtonGroup(self)
+        for key, text, tip in (("a", "Auto", "Vertex, edge or face - whatever is under the cursor"), ("v", "Vertex", "Pick vertices (1)"),
+                               ("e", "Edge", "Pick edges (2)"), ("f", "Face", "Pick faces (3)")):
+            b = QToolButton(); b.setText(text); b.setToolTip(tip); b.setCheckable(True); b.setAutoRaise(False)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(lambda _=False, k=key: self._con_pick_mode(k))
+            grp.addButton(b); row.addWidget(b); self.con_mode_btns[key] = b
+        gl.addLayout(row)
+        self.con_help = _small("")
+        gl.addWidget(self.con_help)
+        self.con_custom_cb = QCheckBox("Type a value (otherwise keep the current one)")
+        self.con_custom_cb.toggled.connect(lambda b: setattr(self.v, "con_custom", b))
+        gl.addWidget(self.con_custom_cb)
+        self.con_val_sp = QDoubleSpinBox(); self.con_val_sp.setRange(0, 1e9); self.con_val_sp.setDecimals(4)
+        self.con_val_sp.setValue(1.0)
+        self.con_axis_cb = QComboBox()
+        for n, a in (("World X", 0), ("World Y", 1), ("World Z", 2)):
+            self.con_axis_cb.addItem(n, a)
+        self.con_axis_cb.setCurrentIndex(2)
+        self.con_axis_cb.activated.connect(lambda i: setattr(self.v, "con_axis", self.con_axis_cb.itemData(i)))
+        self.con_val_sp.valueChanged.connect(self._con_value_edited)
+        self.con_val_row = QWidget(); vr = QHBoxLayout(self.con_val_row); vr.setContentsMargins(0, 0, 0, 0)
+        vr.addWidget(QLabel("Value")); vr.addWidget(self.con_val_sp, 1); vr.addWidget(self.con_axis_cb, 1)
+        gl.addWidget(self.con_val_row)
+        rb = QCheckBox("Move the whole body (not only the picked part)"); rb.setChecked(True)
+        rb.toggled.connect(lambda b: setattr(self.v, "con_rigid", b))
+        gl.addWidget(rb)
+        self.con_apply_btn = QPushButton("Apply constraint (Enter)")
+        self.con_apply_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.con_apply_btn.clicked.connect(lambda: self.v.finish_constraint())
+        gl.addWidget(self.con_apply_btn)
+        gl.addWidget(_small("Constraints in this model"))
+        self.con_list = QListWidget()
+        self.con_list.setMinimumHeight(120)
+        self.con_list.setToolTip("Click one to highlight it (green = stays, orange = moves). Red [!] = it cannot be satisfied.")
+        self.con_list.currentRowChanged.connect(self._con_row_changed)
+        gl.addWidget(self.con_list)
+        self.con_upd_btn = QPushButton("Set selected constraint to the value above")
+        self.con_upd_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.con_upd_btn.clicked.connect(self._con_update_value)
+        gl.addWidget(self.con_upd_btn)
+        row = QHBoxLayout(); row.setSpacing(3)
+        for text, fn in (("Delete", lambda: self.v.delete_constraint()), ("On / Off", lambda: self.v.toggle_constraint()),
+                         ("Clear all", lambda: self.v.clear_constraints())):
+            b = QPushButton(text); b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            row.addWidget(b)
+        gl.addLayout(row)
+        shw = QCheckBox("Show constraint symbols"); shw.setChecked(True)
+        shw.toggled.connect(lambda b: (setattr(self.v, "con_show", b), self.v.update()))
+        gl.addWidget(shw)
+        lay.addWidget(self.sec_con)
+
+        # ---- mirror body
+        self.sec_mir, gl = self._group("Mirror body")
+        self.mir_lbl = _small("")
+        gl.addWidget(self.mir_lbl)
+        row = QHBoxLayout(); row.setSpacing(3)
+        ub = QPushButton("Use the selected bodies")
+        ub.setToolTip("Mirror every body the current selection touches (select several with Shift+click). Or Ctrl+click bodies in the view: it adds / removes one.")
+        ub.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        ub.clicked.connect(lambda: self.v.mir_use_selection())
+        cb0 = QPushButton("Clear"); cb0.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        cb0.clicked.connect(lambda: self.v.mir_clear())
+        row.addWidget(ub, 1); row.addWidget(cb0)
+        gl.addLayout(row)
+        pc = QComboBox()
+        for name, _ in MIR_PRESETS:
+            pc.addItem(name)
+        pc.activated.connect(lambda i: self.v.mir_preset(i))
+        gl.addLayout(_row("Start plane at", pc))
+        self.mir_sp = []
+        for label, tip, rng, dec, step in (("Slide", "Move the plane along its normal (model units)", 1e9, 4, 0.05),
+                                           ("Tilt A", "Tilt the plane about its first axis (degrees)", 90, 3, 0.5),
+                                           ("Tilt B", "Tilt the plane about its second axis (degrees)", 90, 3, 0.5)):
+            sp = QDoubleSpinBox(); sp.setRange(-rng, rng); sp.setDecimals(dec); sp.setSingleStep(step); sp.setToolTip(tip)
+            sp.valueChanged.connect(lambda _x, i=len(self.mir_sp): self._mir_spin(i))
+            gl.addLayout(_row(label, sp))
+            self.mir_sp.append(sp)
+        gl.addWidget(_small("Or drag in the view: drag = slide, Shift+drag = tilt. Pink ghost = the mirrored body."))
+        ab = QPushButton("Auto-align to the point cloud")
+        ab.setToolTip("Fine-tunes the plane so the mirrored body sits on the visible point cloud. Place the plane roughly first.")
+        ab.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        ab.clicked.connect(lambda: self.v.mir_align())
+        gl.addWidget(ab)
+        self.mir_res = _small("")
+        gl.addWidget(self.mir_res)
+        kb = QCheckBox("Keep the original (make a copy)"); kb.setChecked(True)
+        kb.toggled.connect(lambda b: setattr(self.v, "mir_keep", b))
+        wb = QCheckBox("Join the copy to the original where they touch the plane")
+        wb.toggled.connect(lambda b: setattr(self.v, "mir_weld", b))
+        lb = QCheckBox("Keep linked - the copy follows later edits of the original"); lb.setChecked(True)
+        lb.toggled.connect(lambda b: setattr(self.v, "mir_link", b))
+        gl.addWidget(kb); gl.addWidget(lb); gl.addWidget(wb)
+        cb = QPushButton("Create mirrored body (Enter)")
+        cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        cb.clicked.connect(lambda: self.v.mir_commit())
+        gl.addWidget(cb)
+        gl.addWidget(_small("Linked mirrors (edit the original and the mirrored body follows; edits to the mirrored body itself are overwritten - unlink it to edit it freely)"))
+        self.mir_links = QListWidget(); self.mir_links.setMaximumHeight(80)
+        gl.addWidget(self.mir_links)
+        row = QHBoxLayout(); row.setSpacing(3)
+        for text, fn in (("Unlink selected", lambda: self.v.mir_unlink(self.mir_links.currentRow())), ("Unlink all", lambda: self.v.mir_unlink())):
+            b = QPushButton(text); b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            row.addWidget(b)
+        gl.addLayout(row)
+        lay.addWidget(self.sec_mir)
 
         # ---- display (rarely changed -> folded away)
         disp = Section("Display", collapsed=True)
@@ -2346,6 +3430,74 @@ class MainWindow(QMainWindow):
         sa.setMinimumWidth(190)
         self.props_dock.setWidget(sa)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.props_dock)
+
+    # -- constraints panel
+    def _con_pick_mode(self, k):
+        if k == "a":
+            self.v.con_auto = True
+            self.v.update_hud(); self.v.update(); self.update_panel()
+        else:
+            self.v.set_mode(k)
+        self.v.con_hit = None
+
+    def _con_value_edited(self, x):
+        self.v.con_value = x / (self.v.meas_scale if self.v.con_kind == "distance" else 1.0)
+
+    def _con_row_changed(self, r):
+        self.v.set_con_sel(r)
+        c = self.v.constraints[r] if 0 <= r < len(self.v.constraints) else None
+        if c is not None and c["kind"] in ("distance", "angle"):
+            self.con_val_sp.blockSignals(True)
+            self.con_val_sp.setValue(c["value"] * (self.v.meas_scale if c["kind"] == "distance" else 1.0))
+            self.con_val_sp.blockSignals(False)
+            self.v.con_value = c["value"]
+
+    def _con_update_value(self):
+        v = self.v
+        i = v.con_sel
+        if i is None or i >= len(v.constraints):
+            return v.msg("Select a constraint in the list first")
+        c = v.constraints[i]
+        if c["kind"] == "align":
+            return v.set_constraint_value(self.con_axis_cb.currentData())
+        v.set_constraint_value(self.con_val_sp.value() / (v.meas_scale if c["kind"] == "distance" else 1.0))
+
+    # -- mirror panel
+    def _mir_spin(self, i):
+        if getattr(self, "_mir_busy", False):
+            return
+        v = self.v.mir_p
+        val = self.mir_sp[i].value()
+        v2 = [val, np.radians(val), np.radians(val)][i]
+        self.v.mir_set_params(**{"d" if i == 0 else ("a" if i == 1 else "b"): v2})
+
+    def refresh_mir(self):
+        v = self.v
+        self._mir_busy = True
+        for i, sp in enumerate(self.mir_sp):
+            sp.blockSignals(True)
+            sp.setValue(v.mir_p[i] if i == 0 else float(np.degrees(v.mir_p[i])))
+            sp.blockSignals(False)
+        self._mir_busy = False
+        n = len(v.mir_src) if v.mir_valid() else 0
+        nb = v.mir_body_count()
+        self.mir_lbl.setText("%d bod%s (%d faces) will be mirrored." % (nb, "y" if nb == 1 else "ies", n) if n else
+                             "Select one or more bodies: Ctrl+click rows in the Bodies list, or Ctrl+click bodies in the view (again to remove one).")
+        self.mir_res.setText(v.mir_info)
+        self.mir_links.clear()
+        nm = lambda i: v.reg.bodies[i].name if i in v.reg.bodies else "#%d" % i
+        for L in v.mirrors:
+            self.mir_links.addItem("%s  <-  %s" % (nm(L["dst"]), ", ".join(nm(i) for i in L["src"])))
+
+    def refresh_con_list(self):
+        v = self.v
+        self.con_list.blockSignals(True)
+        self.con_list.clear()
+        for i in range(len(v.constraints)):
+            self.con_list.addItem(v.con_text(i))
+        if v.con_sel is not None and 0 <= v.con_sel < len(v.constraints):
+            self.con_list.setCurrentRow(v.con_sel)
+        self.con_list.blockSignals(False)
 
     def refresh_meas_list(self):
         v = self.v

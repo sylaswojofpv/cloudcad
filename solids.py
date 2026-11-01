@@ -12,11 +12,11 @@ from scipy.spatial import cKDTree
 
 from mesh_core import _newell
 
-SHAPES = ["box", "cylinder", "cone", "sphere", "plane", "loft", "extrude"]
+SHAPES = ["box", "cylinder", "cone", "sphere", "plane", "loft", "extrude", "revolve"]
 SHAPE_NAMES = {"box": "Box", "cylinder": "Cylinder", "cone": "Cone", "sphere": "Sphere",
-               "plane": "Plane", "loft": "Loft", "extrude": "Extrusion"}
-MIN_POINTS = {"box": 3, "cylinder": 5, "cone": 6, "sphere": 4, "plane": 3, "loft": 8, "extrude": 6}
-SWEEP_SHAPES = ("loft", "extrude")       # these two have a linear / fitted option
+               "plane": "Plane", "loft": "Loft", "extrude": "Extrusion", "revolve": "Revolve"}
+MIN_POINTS = {"box": 3, "cylinder": 5, "cone": 6, "sphere": 4, "plane": 3, "loft": 8, "extrude": 6, "revolve": 8}
+SWEEP_SHAPES = ("loft", "extrude", "revolve")       # these two have a linear / fitted option
 SWEEP_MODES = ("linear", "fitted")
 
 
@@ -289,6 +289,8 @@ def fit_solid(shape, P, seg=24, mode="linear", lseg=0):
         V, F, info = fit_extrusion(P, mode, lseg, seg)
     elif shape == "loft":
         V, F, info = fit_loft(P, mode, lseg, seg)
+    elif shape == "revolve":
+        V, F, info = fit_revolve(P, mode, lseg, seg)
     else:
         raise ValueError("unknown shape %r" % shape)
     return V, F, info
@@ -584,3 +586,128 @@ def fit_loft(P, mode="linear", lseg=0, seg=24):
     V, F = _close_sweep(rings)
     return V, F, "%d segments along x %d around, RMS=%.2g%s" % (
         len(rings) - 1, N, float(np.sqrt(np.mean(resid ** 2))), ", curved" if coef is not None else "")
+
+
+# =============================================================== revolve
+# Best-fit surface of revolution: find the axis, then fit the profile curve r(t) (radius against position along the
+# axis) to ALL picked points, and spin it around the axis.  Vases, bottles, bowls, domes, cones, cylinders, rings...
+def _rev_scatter(X, a, u, w, c, nb):
+    """How far the points are from being a surface of revolution about the axis (a, centre c): RMS scatter of the
+    radius around a straight-line fit per slab along the axis (0 = perfect)."""
+    t = X @ a
+    r = np.linalg.norm(np.c_[X @ u - c[0], X @ w - c[1]], axis=1)
+    o = np.argsort(t)
+    sse, cnt = 0.0, 0
+    for g in np.array_split(o, nb):
+        if len(g) < 3:
+            continue
+        A = np.c_[t[g], np.ones(len(g))]
+        res = r[g] - A @ np.linalg.lstsq(A, r[g], rcond=None)[0]
+        sse += float(res @ res); cnt += len(g)
+    return np.sqrt(sse / max(cnt, 1))
+
+
+def _profile_fit(sn, r, Ns):
+    """Smooth radius at Ns evenly spaced stations (sn in 0..Ns-1): hat-function least squares + smoothness."""
+    n = len(sn)
+    sn = np.clip(sn, 0, Ns - 1 - 1e-9)
+    j0 = np.floor(sn).astype(int)
+    f = sn - j0
+    A = np.zeros((n, Ns))
+    A[np.arange(n), j0] = 1 - f
+    A[np.arange(n), j0 + 1] = f
+    rm = float(np.mean(r))
+    reg, rhs = [], []
+    for j in range(Ns):
+        v = np.zeros(Ns); v[j] = 1e-3; reg.append(v); rhs.append(1e-3 * rm)
+        if j < Ns - 1:
+            v = np.zeros(Ns); v[j], v[j + 1] = -0.05, 0.05; reg.append(v); rhs.append(0.0)
+        if 0 < j < Ns - 1:
+            v = np.zeros(Ns); v[j - 1], v[j], v[j + 1] = 0.25, -0.5, 0.25; reg.append(v); rhs.append(0.0)
+    R = np.linalg.lstsq(np.vstack([A, reg]), np.r_[r, rhs], rcond=None)[0]
+    return R, A @ R - r
+
+
+def fit_revolve(P, mode="linear", lseg=0, seg=24):
+    P = np.asarray(P, float)
+    n = len(P)
+    scale = float(np.ptp(P, axis=0).max()) + 1e-30
+    cen = P.mean(0)
+    X = P - cen
+    cands = []
+    for fn in (fit_cylinder, fit_cone):
+        try:
+            cands.append(fn(P)[1])
+        except Exception:
+            pass
+    cands += list(np.linalg.eigh(np.cov(X.T))[1].T)
+    nb = int(np.clip(n // 8, 3, 12))
+    best = None
+    for a0 in cands:
+        a0 = _unit(np.asarray(a0, float))
+        u, w = _basis(a0)
+        Q = np.c_[X @ u, X @ w]
+        c0, _ = _circle2d(Q)
+        def score(q, a0=a0, u=u, w=w):
+            a = _unit(a0 + q[0] * u + q[1] * w)
+            uu, ww = _basis(a)
+            # the centre offsets are given in the (u, w) frame of a0 -> express as a point, then in the new frame
+            o = q[2] * u + q[3] * w
+            return _rev_scatter(X - o, a, uu, ww, (0.0, 0.0), nb)
+        x0 = np.array([0.0, 0.0, c0[0], c0[1]])
+        simplex = np.vstack([x0, x0 + [0.05, 0, 0, 0], x0 + [0, 0.05, 0, 0], x0 + [0, 0, 0.03 * scale, 0], x0 + [0, 0, 0, 0.03 * scale]])
+        sol = minimize(score, x0, method="Nelder-Mead",
+                       options=dict(initial_simplex=simplex, maxiter=400, xatol=1e-7, fatol=1e-10 * scale))
+        if best is None or sol.fun < best[0]:
+            best = (float(sol.fun), a0, u, w, sol.x)
+    _, a0, u, w, q = best
+    a = _unit(a0 + q[0] * u + q[1] * w)
+    o = cen + q[2] * u + q[3] * w                       # a point on the axis
+    uu, ww = _basis(a)
+    Y = P - o
+    t, r = Y @ a, np.linalg.norm(np.c_[Y @ uu, Y @ ww], axis=1)
+    t0, t1 = float(t.min()), float(t.max())
+    L = t1 - t0
+    if L < 1e-6 * scale:
+        raise ValueError("all points are at the same height along the axis - spread them along the shape")
+    if float(np.median(r)) < 1e-4 * scale:
+        raise ValueError("points lie along a line - pick points around the surface of the shape")
+    sn = (t - t0) / L
+    smooth = mode == "fitted" and n >= 10
+    Ns = int(np.clip(round(n / 5), 4, 12 if smooth else 24))
+    if lseg and not smooth:
+        Ns = max(2, int(lseg) + 1)
+    R, resid = _profile_fit(sn * (Ns - 1), r, Ns)
+    nst = (int(lseg) or 16) + 1 if smooth else Ns
+    tq = np.linspace(0, 1, nst)
+    Rq = CubicSpline(np.arange(Ns), R)(tq * (Ns - 1)) if smooth else R
+    Rq = np.maximum(Rq, 0.0)
+    N = int(np.clip(seg, 8, 64))
+    ang = np.linspace(0, 2 * np.pi, N, endpoint=False)
+    dirs = np.outer(np.cos(ang), uu) + np.outer(np.sin(ang), ww)
+    pole = 0.02 * float(np.max(Rq)) + 1e-12             # a radius this small at an end closes to a point
+    verts, F = [], []
+    rows = []                                           # per station: list of vertex ids (1 = a pole)
+    for k, (q_, rr) in enumerate(zip(tq, Rq)):
+        c_ = o + a * (t0 + q_ * L)
+        if rr < pole and k in (0, nst - 1):
+            rows.append([len(verts)]); verts.append(c_)
+        else:
+            rows.append(list(range(len(verts), len(verts) + N))); verts += list(c_ + max(rr, 1e-3 * scale) * dirs)
+    for k in range(nst - 1):
+        A_, B_ = rows[k], rows[k + 1]
+        if len(A_) == 1:
+            F += [[A_[0], B_[(i + 1) % N], B_[i]] for i in range(N)]
+        elif len(B_) == 1:
+            F += [[A_[i], A_[(i + 1) % N], B_[0]] for i in range(N)]
+        else:
+            F += [[A_[i], A_[(i + 1) % N], B_[(i + 1) % N], B_[i]] for i in range(N)]
+    for ring, flip in ((rows[0], True), (rows[-1], False)):
+        if len(ring) > 1:
+            F.append(ring[::-1] if flip else ring)
+    V = np.array(verts)
+    vol = sum(float(V[f[0]] @ np.cross(V[f[i]], V[f[i + 1]])) for f in F for i in range(1, len(f) - 1))
+    if vol < 0:
+        F = [f[::-1] for f in F]
+    rms = float(np.sqrt(np.mean(resid ** 2)))
+    return V, F, "%d profile segments x %d around, RMS=%.2g%s" % (nst - 1, N, rms, ", smooth" if smooth else "")

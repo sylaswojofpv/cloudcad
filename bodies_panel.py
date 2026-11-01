@@ -2,14 +2,15 @@
 bodies_panel.py -- the Bodies list (left dock).
 
   Point clouds   one row per loaded cloud, tick box = visible
-  Bodies         one row per body, tick box = visible; click a row to select that body
+  Bodies         one row per body, tick box = visible; click a row to select that body (Ctrl or Shift+click adds more)
   boolean folder one per boolean operation: the combined result (tick box) plus the solids it was
                  made from (greyed). The Undo button on the folder gives the original solids back.
+                 Right-click a merged body and choose Undo merge to get the original bodies back.
                  Right-click a body made with the Solid tool to edit the points it was fitted to.
 """
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QBrush, QColor, QFont
-from PySide6.QtWidgets import (QHeaderView, QLabel, QMenu, QPushButton, QTreeWidget, QTreeWidgetItem,
+from PySide6.QtGui import QBrush, QColor, QFont, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QApplication, QHeaderView, QLabel, QInputDialog, QLineEdit, QMenu, QPushButton, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
 from bodies import OP_NAMES
@@ -37,6 +38,9 @@ class BodiesPanel(QWidget):
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.itemChanged.connect(self._item_changed)
         self.tree.itemClicked.connect(self._item_clicked)
+        self.tree.itemDoubleClicked.connect(lambda it, col: self._rename(it))
+        QShortcut(QKeySequence("F2"), self.tree, activated=lambda: self._rename(self.tree.currentItem()),
+                  context=Qt.ShortcutContext.WidgetShortcut)
         self.tree.itemExpanded.connect(lambda it: self._collapsed.discard(self._key(it)))
         self.tree.itemCollapsed.connect(lambda it: self._collapsed.add(self._key(it)))
         self.tree.customContextMenuRequested.connect(self._menu)
@@ -144,12 +148,35 @@ class BodiesPanel(QWidget):
 
     def _item_clicked(self, it, col):
         kind, ident = it.data(0, KIND), it.data(0, ID)
+        add = bool(QApplication.keyboardModifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
         if kind == "body":
-            self.v.select_body(ident)
+            self.v.select_body(ident, add)               # Ctrl / Shift+click adds or removes a body
         elif kind == "folder":
             f = self.v.reg.folders.get(ident)
             if f is not None:
-                self.v.select_body(f.result)
+                self.v.select_body(f.result, add)
+
+    def _rename(self, it):
+        """Rename a body, a boolean folder or a point cloud (double-click, F2 or right-click > Rename)."""
+        if it is None:
+            return
+        kind, ident = it.data(0, KIND), it.data(0, ID)
+        v = self.v
+        if kind in ("body", "operand"):
+            obj = v.reg.bodies.get(ident)
+        elif kind == "folder":
+            obj = v.reg.folders.get(ident)
+        elif kind == "cloud":
+            obj = v.clouds[ident] if 0 <= ident < len(v.clouds) else None
+        else:
+            return
+        if obj is None:
+            return
+        old = obj["name"] if kind == "cloud" else obj.name
+        new, ok = QInputDialog.getText(self, "Rename", "Name:", QLineEdit.EchoMode.Normal, old)
+        new = new.strip()
+        if ok and new and new != old:
+            v.rename_item(kind, ident, new)
 
     def _menu(self, pos):
         it = self.tree.itemAt(pos)
@@ -158,10 +185,14 @@ class BodiesPanel(QWidget):
         kind, ident = it.data(0, KIND), it.data(0, ID)
         reg = self.v.reg
         m = QMenu(self)
+        if kind in ("body", "operand", "folder", "cloud"):
+            m.addAction("Rename…", lambda: self._rename(it))
         if kind in ("body", "operand"):
             b = reg.bodies.get(ident)
             if b is not None and b.state == "live":
                 m.addAction("Select", lambda: self.v.select_body(ident))
+            if b is not None and ident in getattr(reg, "merges", {}):
+                m.addAction("Undo merge", lambda: self.v.undo_merge(ident))
             if b is not None and b.src:
                 m.addAction("Edit points…", lambda: self.v.edit_body_points(ident))
         elif kind == "folder":
