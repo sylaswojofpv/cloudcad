@@ -9,6 +9,8 @@ solids, lasso part of it to build a mesh, snap geometry to its surface, measure
 it, mirror bodies onto it, and combine everything with boolean operations.
 
 Written in Python (PySide6 + OpenGL). Windows is the primary platform.
+There is no need to read the entire readme. This program is pretty easy to navigate 
+if you are already familiar with 3d modeling software.
 
 
 TABLE OF CONTENTS
