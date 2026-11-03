@@ -39,7 +39,7 @@ TABLE OF CONTENTS
   16. Tips, limits and troubleshooting
 
 
-1. FEATURES AT A GLANCE
+FEATURES AT A GLANCE
 -----------------------
 Point clouds
   - Load many files at once, show / hide each one, drag and drop files in.
@@ -91,7 +91,7 @@ Organizing
   - Save the whole model as a .json file; export to Wavefront OBJ.
 
 
-2. INSTALLATION
+INSTALLATION
 ---------------
 You need Python 3.9 or newer. Python 3.10 - 3.12 is the safest choice: some
 packages (Open3D in particular) publish wheels for brand-new Python versions
@@ -127,7 +127,7 @@ driver will do. If your driver does not support multisampling and the window
 stays blank, update the graphics driver.
 
 
-3. STARTING THE PROGRAM
+STARTING THE PROGRAM
 -----------------------
 From a command prompt in the program folder:
 
@@ -141,7 +141,7 @@ Run it with "python modeler.py" (not by double-clicking) the first time, so
 that any error message stays visible in the console.
 
 
-4. QUICK START
+QUICK START
 --------------
 1. File > Open point clouds (Ctrl+O), pick one or more files. The camera frames
    the cloud and a starting plane appears.
@@ -160,7 +160,7 @@ that any error message stays visible in the console.
    model elsewhere.
 
 
-5. THE WINDOW
+THE WINDOW
 -------------
  - Center: the 3D view. A small hint line in its corner tells you what the
    current tool does (turn it on / off with H).
@@ -177,7 +177,7 @@ that any error message stays visible in the console.
 The Properties panel scrolls if the window is short.
 
 
-6. MOVING AROUND THE 3D VIEW
+MOVING AROUND THE 3D VIEW
 ----------------------------
     Orbit                 middle mouse button drag, or Alt + left drag
     Pan                   Shift + middle drag, or right mouse drag
@@ -188,7 +188,7 @@ The Properties panel scrolls if the window is short.
 The view is Z-up. The grid sits at the lowest point of the loaded cloud.
 
 
-7. LOADING POINT CLOUDS
+LOADING POINT CLOUDS
 -----------------------
 File > Open point clouds (Ctrl+O) replaces the loaded clouds with the files you
 choose (you can pick several at once). File > Add point clouds (Ctrl+Shift+O)
@@ -224,7 +224,7 @@ Display options (Properties panel > Display, folded by default):
     (lower it to see the cloud through your surfaces).
 
 
-8. TOOLS
+TOOLS
 --------
 Pick a tool from the toolbar or press its key. Esc cancels what you are doing.
 Shift or Ctrl clicks usually add to or remove from a selection.
@@ -234,7 +234,7 @@ Selection modes (used by Select and Move, and by several others):
 When you switch mode, the selection is converted where possible.
 
 
-8.1  SELECT  (Q)
+1. SELECT  (Q)
 ----------------
 Click a vertex, edge or face (depending on the mode) to select it.
 Shift+click adds or removes. Click empty space to clear. Selected faces are
@@ -248,7 +248,7 @@ Select a face of a body and the whole body can be picked from the Bodies list;
 see section 11.
 
 
-8.2  MOVE / TRANSFORM  (W)
+2. MOVE / TRANSFORM  (W)
 --------------------------
 Select vertices, edges or faces and move them:
 
@@ -280,7 +280,7 @@ Snap to surface (Shift+S) moves the selection onto the cloud surface in one go,
 without dragging.
 
 
-8.3  FACE FROM POINTS  (P)
+3. FACE FROM POINTS  (P)
 --------------------------
 Click points on the cloud (or existing mesh vertices) to make a face.
   - After the number of clicks set in "Finish after" (default 4) the face is
@@ -294,7 +294,7 @@ Click points on the cloud (or existing mesh vertices) to make a face.
     turned to face the camera.
 
 
-8.4  BEST-FIT SOLID  (B)
+4. BEST-FIT SOLID  (B)
 ------------------------
 Choose a shape, click points on the surface of the real object, press Enter.
 The shape is fitted to the points with a least-squares fit, so the points do
@@ -330,7 +330,7 @@ After a solid is created the Move tool is active with the whole solid selected,
 and everything in section 9 works on its faces and vertices.
 
 
-8.5  MESH FROM POINTS  (G)
+5. MESH FROM POINTS  (G)
 --------------------------
 Builds a triangle mesh from a region of the point cloud.
 
@@ -370,7 +370,7 @@ points is cut away, so an open patch does not turn into a closed blob.
 The new mesh is added as its own body ("Poisson mesh N" or "Mesh N").
 
 
-8.6  MEASURE  (R)
+6. MEASURE  (R)
 -----------------
 Pick the kind of measurement, click points, read the numbers next to the lines
 drawn in the 3D view. Measurements stay in the scene and are saved with the
@@ -399,7 +399,7 @@ Measurement display: units label, a scale factor (to show millimeters, feet,
 ...) and the number of decimals are set in the panel and saved with the model.
 
 
-8.7  CONSTRAINTS  (K)
+7. CONSTRAINTS  (K)
 ---------------------
 Constraints make geometry obey a relationship, and keep obeying it while you
 keep editing.
@@ -427,7 +427,7 @@ with [!] and the reason. If the geometry a constraint used is deleted, the
 constraint is removed and you are told. Constraints are saved with the model.
 
 
-8.8  MIRROR BODY  (T)
+8. MIRROR BODY  (T)
 ---------------------
 Creates a mirrored copy of one or more bodies, e.g. the other half of a
 symmetrical object scanned from one side.
@@ -450,7 +450,7 @@ Options:
 Mirror links are saved with the model.
 
 
-9. EDITING OPERATIONS
+EDITING OPERATIONS
 ---------------------
 Operations work on the current selection. The buttons in the Selection panel
 only show what makes sense for the selection mode.
@@ -484,7 +484,7 @@ This is the way to remove unneeded edges after a Subdivide: select the edges in
 Edge mode and press Delete.
 
 
-10. COMBINING BODIES
+COMBINING BODIES
 --------------------
 Select the bodies first: click a face of one body, then Shift+click a face of
 each other one in the view - or click bodies in the Bodies list and Ctrl/Shift+
@@ -525,7 +525,7 @@ MERGE / STITCH (Ctrl+J, or "Merge / stitch" in the panel)
     get the original bodies back.
 
 
-11. THE BODIES LIST
+THE BODIES LIST
 -------------------
 The left panel (F2) lists everything in the scene.
 
@@ -551,7 +551,7 @@ Use the list to pick bodies for a boolean or merge, which is easier than
 clicking in a crowded view.
 
 
-12. UNDO AND REDO
+UNDO AND REDO
 -----------------
     Ctrl+Z   undo          Ctrl+Y   redo
 
@@ -565,7 +565,7 @@ Up to 100 steps are kept. Showing or hiding bodies and the results of booleans,
 merges and mirrors are all part of the history.
 
 
-13. SAVING, OPENING, EXPORTING
+SAVING, OPENING, EXPORTING
 ------------------------------
 File > Save model (Ctrl+S) writes a .json file containing:
     - all geometry
@@ -586,7 +586,7 @@ Hidden bodies, and the original solids stored inside boolean folders, are not
 exported.
 
 
-14. KEYBOARD SHORTCUTS
+KEYBOARD SHORTCUTS
 ----------------------
 Tools
     Q  Select                      W  Move / Transform
@@ -636,7 +636,7 @@ Mouse
     Alt + left drag = orbit   Wheel = zoom to cursor
 
 
-15. PROJECT FILES
+PROJECT FILES
 -----------------
     modeler.py        the application: main window, 3D view, tools, panels
     mesh_core.py      point cloud loader, the mesh (faces, vertices, edit
@@ -655,7 +655,7 @@ Mouse
     requirements.txt  Python packages
 
 
-16. TIPS, LIMITS AND TROUBLESHOOTING
+TIPS, LIMITS AND TROUBLESHOOTING
 ------------------------------------
 Picking points
   - If you cannot reach a particular cloud point, zoom in and click right on
