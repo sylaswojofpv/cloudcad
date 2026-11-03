@@ -1,10 +1,6 @@
-
-
-<img width="960" height="495" alt="CloudCAD" src="https://github.com/user-attachments/assets/38f4cf6d-a291-4d76-bf99-d8ca16daf5a5" />
-
-
-POINT CLOUD MODELER
+CloudCAD
 ===================
+<img width="960" height="495" alt="CloudCAD" src="https://github.com/user-attachments/assets/38f4cf6d-a291-4d76-bf99-d8ca16daf5a5" />
 
 A desktop 3D modeling program for building clean, editable models on top of a
 scanned point cloud. Load one or more point clouds (.xyz and similar), then use
